@@ -141,6 +141,36 @@ def test_replacement_keeps_each_word_run_and_preserves_boundary_spaces():
     assert_word_text_integrity(raw, anonymous)
 
 
+def test_alias_shorter_than_fragmented_word_runs_exports_and_restores():
+    value = "Очень длинное чувствительное значение"
+    raw = make_docx(["before ", *value, " after"])
+    parsed = parse_docx(raw)
+    block = parsed.blocks[0]
+    start = block.text.index(value)
+    alias = "[[PII-A7K3-001]]"
+    assert len(alias) < len(value)
+    selected = Finding(
+        "f1", block.id, start, start + len(value), value, "PII",
+        ["manual"], "accepted", 1.0, alias=alias,
+    )
+
+    anonymous, _ = patch_docx(raw, parsed.blocks, [selected])
+
+    assert text(anonymous) == f"before {alias} after"
+    assert value not in text(anonymous)
+    with zipfile.ZipFile(io.BytesIO(anonymous)) as zf:
+        root = etree.fromstring(zf.read("word/document.xml"))
+    text_nodes = [node for node in root.iter() if node.tag == f"{{{W}}}t"]
+    assert all(node.text for node in text_nodes)
+    assert_word_text_integrity(raw, anonymous)
+
+    restored, counts, unknown = replace_aliases(anonymous, {alias: value})
+    assert text(restored) == f"before {value} after"
+    assert counts == {alias: 1}
+    assert unknown == []
+    assert_word_text_integrity(anonymous, restored)
+
+
 def test_word_integrity_rejects_empty_run_text():
     original = make_docx(["Alpha", " Beta"])
     parsed = parse_docx(original)

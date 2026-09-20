@@ -353,12 +353,26 @@ def _apply_to_nodes(
             last_value = (last.get(attr) if attr else last.text) or ""
         prefix = first_value[: start - a0]
         suffix = last_value[end - al :]
-        # Keep each affected Word run populated. Collapsing the replacement into
-        # the first w:t leaves empty text elements under the remaining run
-        # properties; Word may repair the package even when LibreOffice accepts it.
-        if len(replacement) < len(touched):
-            raise UnsafeDocument("Алиас короче числа затронутых текстовых узлов")
-        weights = [min(b, end) - max(a, start) for a, b, _ in touched]
+        # Word may split one visible value into more XML text nodes than there
+        # are characters in the alias (tracked changes and field formatting do
+        # this especially often). Keep as many carrier nodes as the alias can
+        # populate and remove only the surplus text elements. Their surrounding
+        # runs and run properties stay in place, which is valid OOXML and avoids
+        # the empty w:t elements that make Word repair otherwise sound files.
+        carrier_count = min(len(touched), len(replacement))
+        if not carrier_count:
+            raise UnsafeDocument("Пустая замена недопустима")
+        if carrier_count == 1:
+            carrier_indexes = [0]
+        else:
+            carrier_indexes = [
+                round(index * (len(touched) - 1) / (carrier_count - 1))
+                for index in range(carrier_count)
+            ]
+        weights = [
+            min(touched[index][1], end) - max(touched[index][0], start)
+            for index in carrier_indexes
+        ]
         remaining = len(replacement)
         chunks: list[str] = []
         offset = 0
@@ -367,15 +381,16 @@ def _apply_to_nodes(
                 remaining
                 if index == len(weights) - 1
                 else min(
-                    remaining - (len(weights) - index - 1),
+                    remaining - (carrier_count - index - 1),
                     max(1, round(len(replacement) * weight / (end - start))),
                 )
             )
             chunks.append(replacement[offset : offset + count])
             offset += count
             remaining -= count
+        chunks_by_index = dict(zip(carrier_indexes, chunks))
         for index, (_, _, node) in enumerate(touched):
-            value = (prefix if index == 0 else "") + chunks[index]
+            value = (prefix if index == 0 else "") + chunks_by_index.get(index, "")
             if index == len(touched) - 1:
                 value += suffix
             if attr == "__wordshield_tail__":
@@ -383,6 +398,12 @@ def _apply_to_nodes(
             elif attr:
                 node.set(attr, value)
             else:
+                if not value and node.tag in TEXT_TAGS:
+                    parent = node.getparent()
+                    if parent is None:
+                        raise UnsafeDocument("Текстовый узел DOCX не имеет родителя")
+                    parent.remove(node)
+                    continue
                 node.text = value
                 if node.tag == f"{{{W}}}t" and value and (
                     value[0].isspace() or value[-1].isspace()
@@ -499,17 +520,25 @@ def assert_word_text_integrity(before: bytes, after: bytes) -> None:
             continue
         old_root, new_root = _xml(source), _xml(right[part])
         old_elements, new_elements = list(old_root.iter()), list(new_root.iter())
-        if [node.tag for node in old_elements] != [node.tag for node in new_elements]:
+        old_structure = [node.tag for node in old_elements if node.tag not in TEXT_TAGS]
+        new_structure = [node.tag for node in new_elements if node.tag not in TEXT_TAGS]
+        if old_structure != new_structure:
             raise UnsafeDocument("Структура Word XML изменилась при замене текста")
-        for old, new in zip(old_elements, new_elements):
-            if old.tag == f"{{{W}}}rPr" and etree.tostring(
-                old, method="c14n"
-            ) != etree.tostring(new, method="c14n"):
-                raise UnsafeDocument("Свойства символов Word изменились")
-            if old.tag != f"{{{W}}}t" or old.text == new.text:
-                continue
-            if old.text and not new.text:
+        old_run_properties = [
+            etree.tostring(node, method="c14n")
+            for node in old_elements if node.tag == f"{{{W}}}rPr"
+        ]
+        new_run_properties = [
+            etree.tostring(node, method="c14n")
+            for node in new_elements if node.tag == f"{{{W}}}rPr"
+        ]
+        if old_run_properties != new_run_properties:
+            raise UnsafeDocument("Свойства символов Word изменились")
+        for new in new_elements:
+            if new.tag in TEXT_TAGS and not new.text:
                 raise UnsafeDocument("Замена создала пустой текстовый узел Word")
+            if new.tag != f"{{{W}}}t":
+                continue
             if new.text and (new.text[0].isspace() or new.text[-1].isspace()):
                 if new.get("{http://www.w3.org/XML/1998/namespace}space") != "preserve":
                     raise UnsafeDocument("Пробел на границе Word run не сохранён")

@@ -1,0 +1,7 @@
+;; Application process and its renderer may use local IPC, never external IPs.
+;; Qwen is deliberately not allowed here. Use only for the no-Qwen candidate.
+(version 1)
+(allow default)
+(deny network-outbound (remote ip "*:*"))
+(deny network-inbound (local ip "*:*"))
+(allow network-inbound (local ip "localhost:8844"))

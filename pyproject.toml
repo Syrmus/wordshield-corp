@@ -1,0 +1,32 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "wordshield-local"
+version = "0.1.0"
+description = "Fail-closed local DOCX anonymizer and alias restorer"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.115,<1",
+  "uvicorn[standard]>=0.34,<1",
+  "jinja2>=3.1,<4",
+  "python-multipart>=0.0.20,<1",
+  "lxml>=5.3,<7",
+  "PyNaCl>=1.5,<2",
+  "httpx>=0.28,<1",
+  "olefile==0.47",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<10", "python-docx>=1.1,<2"]
+
+[project.scripts]
+wordshield = "wordshield.main:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/wordshield"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

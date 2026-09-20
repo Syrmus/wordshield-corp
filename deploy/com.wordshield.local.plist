@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.wordshield.local</string>
+  <key>ProgramArguments</key><array>
+    <string>__APP_DIR__/.venv/bin/wordshield</string>
+  </array>
+  <key>WorkingDirectory</key><string>__APP_DIR__</string>
+  <key>EnvironmentVariables</key><dict>
+    <key>WORDSHIELD_DATA_DIR</key><string>__DATA_DIR__</string>
+    <key>WORDSHIELD_KEYCHAIN_PATH</key><string>/Library/Keychains/System.keychain</string>
+    <key>WORDSHIELD_ALLOWED_USER</key><string>__ALLOWED_USER__</string>
+    <key>WORDSHIELD_TRUST_TAILSCALE_HEADERS</key><string>true</string>
+    <key>WORDSHIELD_LM_BASE_URL</key><string>__LM_BASE_URL__</string>
+    <key>WORDSHIELD_LM_MODEL</key><string>qwen/qwen3-14b</string>
+    <key>WORDSHIELD_PRIVACY_CHECKPOINT</key><string>__MODEL_DIR__/original</string>
+    <key>WORDSHIELD_PRIVACY_DEVICE</key><string>cpu</string>
+    <key>WORDSHIELD_PRIVACY_REQUIRED</key><string>true</string>
+    <key>WORDSHIELD_QWEN_REQUIRED</key><string>true</string>
+    <key>WORDSHIELD_RENDER_REQUIRED</key><string>true</string>
+    <key>WORDSHIELD_LIBREOFFICE</key><string>/Applications/LibreOffice.app/Contents/MacOS/soffice</string>
+    <key>WORDSHIELD_RETENTION_DAYS</key><string>90</string>
+    <key>HF_HUB_OFFLINE</key><string>1</string>
+    <key>TRANSFORMERS_OFFLINE</key><string>1</string>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ProcessType</key><string>Background</string>
+  <key>StandardOutPath</key><string>__LOG_DIR__/service.log</string>
+  <key>StandardErrorPath</key><string>__LOG_DIR__/service-error.log</string>
+  <key>Umask</key><integer>63</integer>
+</dict></plist>

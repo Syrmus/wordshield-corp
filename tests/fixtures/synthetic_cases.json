@@ -1,0 +1,30 @@
+[
+  {
+    "id": "ru-contract",
+    "text": "Договор № SYN-2026/41 между АО «Синтетика» и Марией Тестовой от 14.09.2026. ИНН 7701234567, КПП 770101001, счёт 40702810900000000001, БИК 044525225. Цена 125 000 ₽, комиссия 3 %. Адрес: г. Северск, ул. Учебная, 7. Email maria.test@example.invalid, телефон +7 999 123-45-67.",
+    "expected": [
+      ["DOCUMENT_ID", "Договор № SYN-2026/41"], ["ORG", "АО «Синтетика»"],
+      ["PERSON", "Марией Тестовой"], ["DATE", "14.09.2026"], ["TAX_ID", "7701234567"],
+      ["TAX_ID", "770101001"], ["BANK", "40702810900000000001"], ["BANK", "044525225"],
+      ["PRICE", "125 000 ₽"], ["CITY", "Северск"], ["ADDRESS", "ул. Учебная, 7"],
+      ["EMAIL", "maria.test@example.invalid"], ["PHONE", "+7 999 123-45-67"]
+    ],
+    "neutral": []
+  },
+  {
+    "id": "en-order",
+    "text": "Synthetic Northwind LLC issued invoice INV-8841 to Alex Example on 2026-09-14 for EUR 8,450. Contact alex@example.invalid. API key: synthetic-key-ONLY-TEST-123456.",
+    "expected": [
+      ["ORG", "Synthetic Northwind LLC"], ["DOCUMENT_ID", "INV-8841"], ["PERSON", "Alex Example"],
+      ["DATE", "2026-09-14"], ["PRICE", "EUR 8,450"], ["EMAIL", "alex@example.invalid"],
+      ["SECRET", "synthetic-key-ONLY-TEST-123456"]
+    ],
+    "neutral": []
+  },
+  {
+    "id": "neutral-law",
+    "text": "Федеральный закон от 27.07.2006 № 152-ФЗ действует в России. В разделе 3 приведены 10 общих примеров.",
+    "expected": [],
+    "neutral": ["27.07.2006", "Россия", "3", "10"]
+  }
+]

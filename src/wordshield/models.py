@@ -35,6 +35,22 @@ class Block:
     node_paths: list[str] = field(default_factory=list)
 
 
+def hard_boundaries(block: Block) -> set[int]:
+    """Offsets separated by a visible Word break without changing legacy text."""
+    result: set[int] = set()
+    prefix = "hard-boundary:"
+    for item in block.node_paths:
+        if not item.startswith(prefix):
+            continue
+        try:
+            offset = int(item[len(prefix) :])
+        except ValueError:
+            continue
+        if 0 < offset < len(block.text):
+            result.add(offset)
+    return result
+
+
 @dataclass
 class Finding:
     id: str

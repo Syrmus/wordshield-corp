@@ -25,6 +25,11 @@ def technical_schema_block(block):
             and block.text.strip() in SCHEMA_URIS)
 
 
+def is_technical_schema_value(value):
+    """Recognise only exact OOXML infrastructure identifiers."""
+    return value.strip().rstrip('.,;') in SCHEMA_URIS
+
+
 def omit_technical_schemas(blocks, findings):
     ignored = {b.id for b in blocks if technical_schema_block(b)}
     return [f for f in findings if f.block_id not in ignored]

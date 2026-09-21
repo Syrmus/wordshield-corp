@@ -13,8 +13,8 @@ from time import monotonic
 import httpx
 
 from .config import Settings
-from .models import Block, Detection, EntityType, Finding
-from .technical_metadata import omit_technical_schemas
+from .models import Block, Detection, EntityType, Finding, hard_boundaries
+from .technical_metadata import is_technical_schema_value, omit_technical_schemas
 
 PATTERNS: list[tuple[EntityType, re.Pattern[str], float]] = [
     ("EMAIL", re.compile(r"(?<![\w.+-])[\w.+-]+@[\w.-]+\.[A-Za-zА-Яа-я]{2,}\b"), 0.99),
@@ -56,8 +56,14 @@ PATTERNS: list[tuple[EntityType, re.Pattern[str], float]] = [
     (
         "SECRET",
         re.compile(
-            r"(?i)\b(?:api[_ -]?key|token|парол[ья]|секрет)\s*[:=]\s*[^\s,;]{6,}"
+            r"(?i)\b(?:api[_ -]?key|token|bearer|temporary\s+password|password|парол[ья]|секрет)"
+            r"\s*(?:[:=]\s*|\s+)[^\s,;]{6,}"
         ),
+        0.99,
+    ),
+    (
+        "ACCOUNT",
+        re.compile(r"(?i)\b(?:login|username|логин)\s*[:=]\s*[A-ZА-Я0-9._@+-]{3,}"),
         0.99,
     ),
     (
@@ -114,6 +120,10 @@ PERSON_TRIPLE_RE = re.compile(
     r"(?<!\w)[А-ЯЁ][а-яё]{2,}(?:-[А-ЯЁ][а-яё]{2,})?"
     r"(?:[ \t]{1,3}[А-ЯЁ][а-яё]{2,}(?:-[А-ЯЁ][а-яё]{2,})?){2}(?!\w)"
 )
+PATRONYMIC_RE = re.compile(
+    r"(?i)(?:вич(?:а|у|ем|е)?|ич(?:а|у|ем|е)?|"
+    r"вн(?:а|ы|е|у|ой|ою)|ичн(?:а|ы|е|у|ой|ою)|Ильич(?:а|у|ем|е)?)$"
+)
 PASSPORT_ISSUER_RE = re.compile(
     r"(?i)\b(?:[А-ЯЁ]{2,4}\s*№\s*\d{1,3}\s+)?отдел(?:а|ом)?\s+"
     r"[А-ЯЁA-Z]{2,15}\s+России\s+по\s+Санкт-Петербургу\s+и\s+"
@@ -144,11 +154,17 @@ LATIN_COMPANY_RE = re.compile(
 )
 PATTERNS.extend([
     ("ORG", re.compile(r'(?i)\b(?:общество\s+с\s+ограниченной\s+ответственностью|публичное\s+акционерное\s+общество|акционерное\s+общество)\s*[«"][^»"\n]{2,100}[»"]'), 0.99),
-    ("DOCUMENT_ID", re.compile(r"(?i)\b(?:contract|invoice|order)\s*[#№]\s*[\w./-]{2,}\b"), 0.99),
+    ("DOCUMENT_ID", re.compile(r"(?i)\b(?:contract|invoice|order)\s*(?:(?:no\.?|number|#|№)\s*)?[\w./-]{2,}\b"), 0.99),
+    ("DOCUMENT_ID", re.compile(r"(?i)\b(?:company|registration)\s+(?:no\.?|number|#|№)\s*[A-Z0-9./-]{4,}\b"), 0.99),
     ("ORG", re.compile(r'\b(?:ООО|АО|ПАО|ЗАО|ОАО)\s*[«"][^»"\n]{2,100}[»"]'), 0.99),
     ("ORG", LATIN_COMPANY_RE, 0.99),
+    ("ADDRESS", re.compile(
+        r"(?i)\b\d{1,5}\s+[A-Z][A-Za-z'\-]+(?:\s+[A-Z][A-Za-z'\-]+){0,4},\s*"
+        r"[A-Z][A-Za-z'\-]+(?:\s+[A-Z][A-Za-z'\-]+){0,3}\s+"
+        r"[A-Z]{1,2}\d[A-Z\d]?\s*\d[A-Z]{2},\s*(?:United\s+Kingdom|UK)\b"
+    ), 0.99),
     ("PRICE", re.compile(r"(?i)\b(?:EUR|USD|GBP)\s+\d[\d ,]*(?:\.\d{1,2})?\b"), 0.99),
-    ("PRICE", re.compile(r"(?i)\b(?:оплата\s+в\s+течение\s+\d+\s+(?:рабочих\s+|календарных\s+)?дней\s+после\s+(?:подписания|получения\s+сч[её]та)|payment\s+within\s+\d+\s+(?:business\s+)?days\s+of\s+(?:signing|invoice\s+receipt))\b"), 0.99),
+    ("PRICE", re.compile(r"(?i)\b(?:оплата\s+в\s+течение\s+\d+\s+(?:рабочих\s+|календарных\s+)?дней(?:\s+после\s+(?:подписания|получения\s+сч[её]та))?|payment\s+within\s+\d+\s+(?:business\s+)?days(?:\s+of\s+(?:signing|invoice\s+receipt))?)\b"), 0.99),
     ("ORG", PASSPORT_ISSUER_RE, 0.97),
     ("PASSPORT", PASSPORT_SERIES_RE, 0.99),
     ("PASSPORT", PASSPORT_NUMBER_RE, 0.99),
@@ -173,7 +189,7 @@ DOC_DATE_CONTEXT = re.compile(
     r"паспор|invoice|contract|signed|issued|born|date\b"
 )
 PUBLIC_DATE_CONTEXT = re.compile(
-    r"(?i)закон|кодекс|постановлен|федеральн|regulation|directive|law\b"
+    r"(?i)закон|кодекс|постановлен|федеральн|regulation|directive|law\b|public\s+date"
 )
 
 
@@ -206,7 +222,27 @@ def qwen_chunks(
 class RulesDetector:
     def detect(self, blocks: Iterable[Block]) -> list[Detection]:
         out: list[Detection] = []
+        remap: dict[str, tuple[str, int]] = {}
+        segmented: list[Block] = []
         for block in blocks:
+            cuts = [0, *sorted(hard_boundaries(block)), len(block.text)]
+            if len(cuts) == 2:
+                segmented.append(block)
+                continue
+            for number, (start, end) in enumerate(zip(cuts, cuts[1:])):
+                if start == end:
+                    continue
+                segment_id = f"{block.id}::hard-segment:{number}"
+                remap[segment_id] = (block.id, start)
+                segmented.append(Block(segment_id, block.part, block.kind,
+                                       block.text[start:end]))
+        for block in segmented:
+            for match in PERSON_TRIPLE_RE.finditer(block.text):
+                if any(PATRONYMIC_RE.search(word) for word in match.group().split()):
+                    out.append(Detection(
+                        block.id, match.start(), match.end(), match.group(),
+                        "PERSON", "rules", 0.99, True,
+                    ))
             for match in re.finditer(
                 r"(?i)\bпаспорт(?:а|ом)?[ \t]*[:№]?[ \t]*"
                 r"(?P<value>\d{2}[ \t\u00a0\u202f]*\d{2}[ \t\u00a0\u202f]*"
@@ -256,6 +292,20 @@ class RulesDetector:
             for match in re.finditer(r"(?i)\b(?:скидка|комиссия|аванс|предоплата|discount|commission)\s*[:=]?\s*(\d+(?:[.,]\d+)?\s*(?:%|процент(?:ов|а)?\b))", block.text):
                 a, b = match.span(1)
                 out.append(Detection(block.id, a, b, block.text[a:b], "PRICE", "rules", 0.99, True))
+            for match in re.finditer(
+                r"(?i)\b(?:НДС|VAT|комиссия|commission|аванс|advance|предоплата|"
+                r"скидка|discount|service\s+fee)\b[^\d%\r\n]{0,24}"
+                r"(?P<value>\d+(?:[.,]\d+)?\s*%)", block.text
+            ):
+                a, b = match.span("value")
+                out.append(Detection(block.id, a, b, block.text[a:b], "PRICE", "rules", 0.99, True))
+            for match in re.finditer(
+                r"(?i)(?P<value>\d+(?:[.,]\d+)?\s*%)\s*"
+                r"(?:аванс|advance|предоплат|service\s+fee|комисси|commission|НДС|VAT)",
+                block.text,
+            ):
+                a, b = match.span("value")
+                out.append(Detection(block.id, a, b, block.text[a:b], "PRICE", "rules", 0.99, True))
             for match in re.finditer(r"(?i)\bкод\s+подразделения\s*[:№]?\s*(\d{3}-\d{3})\b", block.text):
                 a, b = match.span(1)
                 out.append(Detection(block.id, a, b, block.text[a:b], "DOCUMENT_ID", "rules", 0.99, True))
@@ -264,10 +314,19 @@ class RulesDetector:
                     a, b = match.span()
                     if not any(d.block_id == block.id and d.entity_type == "PRICE" and d.start <= a and b <= d.end for d in out):
                         out.append(Detection(block.id, a, b, block.text[a:b], "PRICE", "rules", 0.99, True))
-            if re.search(r"(?i)подписан|signed|составлен", block.text):
-                for match in re.finditer(r"(?i)\b(?:в|at)\s+((?:[01]?\d|2[0-3]):[0-5]\d(?::[0-5]\d)?)\b", block.text):
-                    a, b = match.span(1)
+            if DOC_DATE_CONTEXT.search(block.text) or re.match(
+                r"(?i)^\s*(?:г\.?\s*)?Санкт-Петербург", block.text
+            ):
+                for match in re.finditer(r"(?<!\d)(?:[01]?\d|2[0-3]):[0-5]\d(?::[0-5]\d)?(?!\d)", block.text):
+                    a, b = match.span()
                     out.append(Detection(block.id, a, b, block.text[a:b], "TIME", "rules", 0.99, True))
+            intro_city = re.match(
+                r"(?i)^\s*(?:г\.?\s*)?(?P<city>Санкт-Петербург[а-яё]{0,8})"
+                r"\s*[,—-].{0,20}(?:19|20)\d{2}", block.text,
+            )
+            if intro_city:
+                a, b = intro_city.span("city")
+                out.append(Detection(block.id, a, b, block.text[a:b], "ADDRESS", "rules", 0.99, True))
             if block.kind.startswith("custom-xml-"):
                 out.append(
                     Detection(
@@ -351,6 +410,12 @@ class RulesDetector:
                 for match in pattern.finditer(block.text):
                     text = match.group(0)
                     start, end = match.span()
+                    if entity_type == "URL":
+                        text = text.rstrip(".,;:!?")
+                        end = start + len(text)
+                    elif entity_type in {"ACCOUNT", "SECRET"}:
+                        text = text.rstrip(".")
+                        end = start + len(text)
                     before = block.text[max(0, start - 150):start]
                     if pattern is PASSPORT_ISSUER_RE and not re.search(
                         r"(?i)паспорт|выдан", before
@@ -388,12 +453,25 @@ class RulesDetector:
                         start += label.end()
                         text = block.text[start:end]
                     if entity_type == "DOCUMENT_ID":
-                        label = re.match(r"(?i)^(?:договор|сч[её]т|акт|заказ|дело|клиент|объект|contract|invoice|order)\s*(?:№|N|#)\s*", text)
+                        label = re.match(
+                            r"(?i)^(?:(?:договор|сч[её]т|акт|заказ|дело|клиент|объект)\s*(?:№|N|#)\s*|"
+                            r"(?:contract|invoice|order)\s*(?:(?:no\.?|number|№|N|#)\s*)?|"
+                            r"(?:company|registration)\s+(?:no\.?|number|№|N|#)\s*)",
+                            text,
+                        )
                         if label:
                             start += label.end()
                             text = block.text[start:end]
                     if entity_type == "SECRET":
-                        label = re.match(r"(?i)^(?:api[_ -]?key|token|парол[ья]|секрет)\s*[:=]\s*", text)
+                        label = re.match(
+                            r"(?i)^(?:api[_ -]?key|token|bearer|temporary\s+password|password|парол[ья]|секрет)"
+                            r"\s*(?:[:=]\s*|\s+)", text
+                        )
+                        if label:
+                            start += label.end()
+                            text = block.text[start:end]
+                    if entity_type == "ACCOUNT":
+                        label = re.match(r"(?i)^(?:login|username|логин)\s*[:=]\s*", text)
                         if label:
                             start += label.end()
                             text = block.text[start:end]
@@ -431,7 +509,19 @@ class RulesDetector:
                     block.id, start, end, block.text[start:end],
                     "ADDRESS", "rules", 0.96, True,
                 ))
-        return out
+        remapped: list[Detection] = []
+        for detection in out:
+            original = remap.get(detection.block_id)
+            if not original:
+                remapped.append(detection)
+                continue
+            block_id, offset = original
+            remapped.append(Detection(
+                block_id, detection.start + offset, detection.end + offset,
+                detection.exact_text, detection.entity_type, detection.source,
+                detection.confidence, detection.format_confirmed,
+            ))
+        return remapped
 
 
 class PrivacyFilterDetector:
@@ -727,16 +817,28 @@ class QwenDetector:
 
 
 def normalize_detections(blocks: list[Block], detections: list[Detection]) -> list[Detection]:
+    blocks_by_id = {b.id: b for b in blocks}
     block_map = {b.id: b.text for b in blocks}
     normalized: list[Detection] = []
     for d in detections:
         text = block_map.get(d.block_id)
         if text is None or text[d.start:d.end] != d.exact_text:
             continue
+        if any(d.start < boundary < d.end
+               for boundary in hard_boundaries(blocks_by_id[d.block_id])):
+            continue
+        if d.entity_type == "URL" and is_technical_schema_value(d.exact_text):
+            continue
+        if d.entity_type == "ADDRESS" and d.source == "privacy-filter" and (
+            re.fullmatch(r"(?i)\s*page\s+\d+\s*,?\s*section\s+[\d.]+\s*", d.exact_text)
+            or (re.search(r"(?i)\bISO\s*\d+|Regulation\s*\(EU\)|Article\s+\d+", d.exact_text)
+                and not re.search(r"(?i)\b(?:street|road|lane|avenue|address|город|улиц|дом)\b", d.exact_text))
+        ):
+            continue
         if d.entity_type == "PERSON" and d.source in {"gliner-ru", "privacy-filter"}:
             for match in PERSON_TRIPLE_RE.finditer(text):
-                if match.start() <= d.start and d.end <= match.end() and re.search(
-                    r"(?i)(?:вич|вича|вичу|вичем|вна|вны|вне|вной|ична|ичны|ичне|ичной|Ильич|Ильича|Ильичу)$", match.group()
+                if match.start() <= d.start and d.end <= match.end() and any(
+                    PATRONYMIC_RE.search(word) for word in match.group().split()
                 ):
                     d = Detection(d.block_id, match.start(), match.end(), match.group(), "PERSON", d.source, d.confidence, False)
                     break
@@ -799,15 +901,13 @@ def _solo_auto(entity_type: EntityType, exact: str, context: str, source: str) -
             and PERSON_TRIPLE_RE.fullmatch(exact):
         # A complete Russian name with a patronymic is stronger evidence than
         # the model's confidence score or a single capitalised word.
-        return bool(re.search(
-            r"(?i)(?:вич(?:а|у|ем|е)?|ич(?:а|у|ем|е)?|"
-            r"вн(?:а|ы|е|у|ой|ою)|ичн(?:а|ы|е|у|ой|ою))$", exact.split()[-1]
-        ))
+        return any(PATRONYMIC_RE.search(word) for word in exact.split())
     if source in {"privacy-filter", "rules"} and entity_type in {"DATE", "TIME"}:
         shape = (PURE_DATE_RE.fullmatch(exact) or FULL_MONTH_DATE_RE.fullmatch(exact)) \
             if entity_type == "DATE" else PURE_TIME_RE.fullmatch(exact)
         return bool(shape and not PUBLIC_DATE_CONTEXT.search(context)
                     and (DOC_DATE_CONTEXT.search(context) or DATE_TIME_RE.search(context)
+                         or re.search(r"(?i)Санкт-Петербург.{0,35}$", context[:context.find(exact)])
                          or (entity_type == "DATE" and exact.startswith("«")
                              and FULL_MONTH_DATE_RE.fullmatch(exact))))
     if source == "privacy-filter":
@@ -883,7 +983,7 @@ def _prefer_precise(candidates: list[Finding], block_map: dict[str, Block]) -> l
                     and outer.start <= inner.start and inner.end <= outer.end]
         if not children:
             continue
-        if "rules" in outer.sources and outer.entity_type in {"PERSON", "ADDRESS", "ORG", "PASSPORT", "BANK", "TAX_ID", "REG_ID", "SECRET", "ACCOUNT", "PRICE", "DOCUMENT_ID"}:
+        if "rules" in outer.sources and outer.entity_type in {"PERSON", "ADDRESS", "ORG", "PASSPORT", "BANK", "TAX_ID", "REG_ID", "SECRET", "ACCOUNT", "PRICE", "DOCUMENT_ID", "EMAIL", "PHONE", "URL", "IP"}:
             # Complete labelled fields dominate smaller model fragments.
             # Only absorb spans that are wholly contained in this one field.
             remove.update(child.id for child in children)
@@ -1026,13 +1126,23 @@ def expand_approved_repetitions(blocks: list[Block], findings: list[Finding], pr
                     add(block, start, end, seed.entity_type, "repeat-local")
 
         if seed.entity_type == "PERSON" and PERSON_TRIPLE_RE.fullmatch(value):
-            surname, first, middle = value.split()
+            words = value.split()
+            patronymic_index = next(
+                (index for index, word in enumerate(words) if PATRONYMIC_RE.search(word)),
+                2,
+            )
+            if patronymic_index == 1:
+                first, middle, surname = words
+            else:
+                surname, first, middle = words
             variants = [surname + " " + first[0] + "." + middle[0] + ".",
-                        surname + " " + first[0] + ". " + middle[0] + "."]
+                        surname + " " + first[0] + ". " + middle[0] + ".",
+                        first[0] + "." + middle[0] + ". " + surname,
+                        first[0] + ". " + middle[0] + ". " + surname]
             # Only the regular masculine consonant-ending paradigm. Other
             # names remain the model's responsibility; originals are retained.
             if re.search(r"(?:вич|Ильич)$", middle) and all(re.search(r"[бвгджзклмнпрстфхцчшщ]$", w) for w in (surname, first)):
-                variants.extend(" ".join(w + suffix for w in (surname, first, middle)) for suffix in ("а", "у"))
+                variants.extend(" ".join(w + suffix for w in (first, middle, surname)) for suffix in ("а", "у"))
             for variant in variants:
                 pattern = re.compile(r"(?<!\w)" + re.escape(variant) + r"(?!\w)")
                 for block in blocks:
@@ -1102,7 +1212,7 @@ def merge_detections(blocks: list[Block], detections: list[Detection]) -> list[F
             types = list(confirmed)
         entity_type = sorted(set(types), key=lambda kind: (-types.count(kind), kind))[0]
         conflict = len(set(types)) > 1
-        accepted = "custom-xml" not in sources and not conflict and (
+        accepted = not conflict and (
             any(d.format_confirmed for d in ds)
             or len(families) >= 2
             or (len(sources) == 1 and _solo_auto(
@@ -1111,12 +1221,17 @@ def merge_detections(blocks: list[Block], detections: list[Detection]) -> list[F
                 sources[0],
             ))
         )
+        if "custom-xml" in sources and not any(d.format_confirmed for d in ds):
+            accepted = False
         text = block_map[block_id].text
         context = text[max(0, start - 45) : min(len(text), end + 45)]
-        if entity_type in {"DATE", "TIME"} and PUBLIC_DATE_CONTEXT.search(context) \
-                and not DOC_DATE_CONTEXT.search(context):
+        public_date = entity_type in {"DATE", "TIME"} and bool(
+            re.search(r"(?i)public\s+date", context)
+            or (PUBLIC_DATE_CONTEXT.search(context) and not DOC_DATE_CONTEXT.search(context))
+        )
+        if public_date:
             accepted = False
-        status = "accepted" if accepted else "pending"
+        status = "rejected" if public_date else ("accepted" if accepted else "pending")
         # Only an explicit citation of a federal law; personal and document
         # dates elsewhere in the same paragraph retain their own decisions.
         if entity_type == "DATE" and PURE_DATE_RE.fullmatch(text[start:end]) \

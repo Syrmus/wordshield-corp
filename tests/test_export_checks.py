@@ -1,4 +1,9 @@
-from wordshield.export_checks import add_exact_repeats, remaining_values, secret_defaults
+from wordshield.export_checks import (
+    add_exact_repeats,
+    remaining_sensitive_fragments,
+    remaining_values,
+    secret_defaults,
+)
 from wordshield.models import Block, Finding
 from wordshield.ooxml import parse_docx, patch_docx
 from test_core import make_docx
@@ -61,3 +66,28 @@ def test_visible_value_split_across_word_runs_is_detected():
                 data=data.replace(b'AlphaBeta',b'Alpha</w:t></w:r><w:r><w:t>Beta')
             dst.writestr(n,data)
     assert remaining_values(out.getvalue(),['AlphaBeta'],[])==['AlphaBeta']
+
+
+def test_repeat_after_word_break_is_a_separate_value():
+    raw=make_docx(['Emily Rose CarterNorthbridge Analytics Ltd'])
+    import io,zipfile
+    out=io.BytesIO()
+    with zipfile.ZipFile(io.BytesIO(raw)) as src,zipfile.ZipFile(out,'w') as dst:
+        for n in src.namelist():
+            data=src.read(n)
+            if n=='word/document.xml':
+                data=data.replace(b'CarterNorthbridge',b'Carter</w:t></w:r><w:r><w:br/></w:r><w:r><w:t>Northbridge')
+            dst.writestr(n,data)
+    block=parse_docx(out.getvalue()).blocks[0]
+    seed=finding(block,'Northbridge Analytics Ltd')
+    assert len(add_exact_repeats([block],[seed]))==1
+
+
+def test_partial_email_and_name_fragments_block_export():
+    raw=make_docx(['test.owner[[PERSON-ABCD-001]] and Northbridge'])
+    source=Block('source','p','paragraph','test.owner@aurora-example.test Northbridge Analytics Ltd')
+    email=finding(source,'test.owner@aurora-example.test','EMAIL')
+    org=finding(source,'Northbridge Analytics Ltd','ORG',start=31,id='org')
+    leaked=remaining_sensitive_fragments(raw,[email,org],['[[PERSON-ABCD-001]]'])
+    assert 'test.owner' in leaked
+    assert 'Northbridge' in leaked

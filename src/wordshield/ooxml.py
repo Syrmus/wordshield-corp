@@ -146,6 +146,18 @@ def _text_nodes(container: etree._Element) -> list[etree._Element]:
     return [node for node in container.iter() if node.tag in TEXT_TAGS]
 
 
+def _hard_boundary_offsets(container: etree._Element) -> list[int]:
+    """Record visible run breaks while retaining legacy concatenated offsets."""
+    cursor = 0
+    boundaries: set[int] = set()
+    for node in container.iter():
+        if node.tag in TEXT_TAGS:
+            cursor += len(node.text or "")
+        elif node.tag in {f"{{{W}}}br", f"{{{W}}}tab", f"{{{W}}}cr"} and cursor:
+            boundaries.add(cursor)
+    return sorted(boundaries)
+
+
 def _attribute_nodes(root: etree._Element) -> list[tuple[etree._Element, str, str]]:
     result = []
     for node in root.iter():
@@ -223,7 +235,12 @@ def parse_docx(raw: bytes) -> ParsedDocx:
                 nodes = _text_nodes(paragraph)
                 text = "".join(node.text or "" for node in nodes)
                 if text:
-                    blocks.append(Block(f"{part}::p::{idx}", part, "paragraph", text))
+                    boundaries = _hard_boundary_offsets(paragraph)
+                    blocks.append(Block(
+                        f"{part}::p::{idx}", part, "paragraph", text,
+                        [f"hard-boundary:{offset}" for offset in boundaries
+                         if offset < len(text)],
+                    ))
                     covered.update(id(n) for n in nodes)
             leaf_idx = 0
             for node in root.iter():

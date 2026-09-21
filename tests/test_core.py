@@ -16,7 +16,7 @@ from wordshield.detectors import (
     privacy_chunks,
     qwen_chunks,
 )
-from wordshield.models import Block, Detection, Finding
+from wordshield.models import Block, Detection, Finding, hard_boundaries
 from wordshield.ooxml import (
     UnsafeDocument,
     assert_word_text_integrity,
@@ -117,6 +117,23 @@ def test_span_across_runs_and_restore():
     assert text(restored) == block.text
     assert counts["[[ORG-A7K3-001]]"] == 1
     assert unknown == []
+
+
+def test_visible_word_break_is_recorded_without_changing_legacy_offsets():
+    raw = make_docx(["Emily Rose CarterNorthbridge Analytics Ltd"])
+    out = io.BytesIO()
+    with zipfile.ZipFile(io.BytesIO(raw)) as src, zipfile.ZipFile(out, "w") as dst:
+        for name in src.namelist():
+            data = src.read(name)
+            if name == "word/document.xml":
+                data = data.replace(
+                    b"CarterNorthbridge",
+                    b"Carter</w:t></w:r><w:r><w:br/></w:r><w:r><w:t>Northbridge",
+                )
+            dst.writestr(name, data)
+    block = parse_docx(out.getvalue()).blocks[0]
+    assert block.text == "Emily Rose CarterNorthbridge Analytics Ltd"
+    assert hard_boundaries(block) == {len("Emily Rose Carter")}
 
 
 def test_replacement_keeps_each_word_run_and_preserves_boundary_spaces():
@@ -1005,7 +1022,11 @@ def test_custom_xml_is_reviewed_patchable_and_restorable():
     }
     detections = RulesDetector().detect(custom_blocks)
     findings = merge_detections(custom_blocks, detections)
-    assert findings and all(f.status == "pending" for f in findings)
+    assert findings
+    assert any(f.exact_text == "Acme Ltd" and f.status == "accepted" for f in findings)
+    assert any(f.exact_text == "https://private.example/schema" and f.status == "accepted"
+               for f in findings)
+    assert any(f.status == "pending" for f in findings if f.sources == ["custom-xml"])
     person = next(b for b in custom_blocks if b.text == "Иван Петров")
     selected = Finding(
         "custom-person",

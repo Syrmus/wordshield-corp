@@ -41,7 +41,12 @@ from .ooxml import (
 from .storage import SessionStore
 from .checkpoints import model_identity, runtime_identity
 from .dictionary import DictionaryStore, apply_dictionary
-from .export_checks import add_exact_repeats, remaining_values, secret_defaults
+from .export_checks import (
+    add_exact_repeats,
+    remaining_sensitive_fragments,
+    remaining_values,
+    secret_defaults,
+)
 from .overlaps import widest_replacements
 from .technical_metadata import omit_technical_schemas
 from .image_removal import remove_images
@@ -474,7 +479,7 @@ class WordShieldService:
         updated = expand_approved_repetitions(
             [Block(**b) for b in payload["blocks"]], primary,
             [(f["block_id"], f["start"], f["end"]) for f in payload["findings"]
-             if f["status"] in {"accepted", "rejected"}]
+             if f["status"] == "rejected"]
         )
         for finding in updated:
             if finding.sources in (["repeat-local"], ["case-form-local"]):
@@ -576,6 +581,14 @@ class WordShieldService:
             raise UnsafeDocument(
                 f"Не удалось безопасно скрыть все повторения выбранных данных: {len(leaked)}. "
                 "Некоторые повторения пропущены, пересекаются с другими заменами или находятся в служебных свойствах. "
+                "Файл не выдан, чтобы не раскрыть данные. Вернитесь к проверке сессии."
+            )
+        fragments = remaining_sensitive_fragments(
+            output, accepted, [f.alias for f in accepted]
+        )
+        if fragments:
+            raise UnsafeDocument(
+                f"После замены остались части чувствительных значений: {len(fragments)}. "
                 "Файл не выдан, чтобы не раскрыть данные. Вернитесь к проверке сессии."
             )
         if b"mapping_blob" in output:

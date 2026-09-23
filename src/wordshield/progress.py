@@ -31,7 +31,7 @@ ANALYSIS_PAGE = """<h1>Идёт локальный анализ</h1>
 <small>Время приблизительное: оно зависит от длины текста, загрузки моделей и других задач на Mac mini. Полоса показывает обработанные фрагменты всех детекторов, а не долю прошедшего времени.</small>
 </section><p>После анализа страница откроет результаты автоматически. Можно вернуться через <a href='/sessions'>«Мои сессии»</a>.</p>
 <script>(()=>{
-const names={'detecting':'Подготовка и загрузка моделей','privacy-detector':'Поиск персональных данных','context-analysis':'Проверка контекста','russian-detector':'Проверка русских имён и реквизитов','combining':'Объединение результатов'};
+const names={'queued':'Файл в очереди','detecting':'Подготовка и загрузка моделей','privacy-detector':'Поиск персональных данных','context-analysis':'Проверка контекста','russian-detector':'Проверка русских имён и реквизитов','combining':'Объединение результатов'};
 const stage=document.getElementById('analysis-stage'),bar=document.getElementById('analysis-bar'),percent=document.getElementById('analysis-percent'),eta=document.getElementById('analysis-eta');
 async function poll(){
 try{

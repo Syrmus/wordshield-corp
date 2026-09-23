@@ -79,3 +79,39 @@ class Detection:
     source: str
     confidence: float
     format_confirmed: bool = False
+
+
+def text_segments(block: Block):
+    cuts = [0, *sorted(hard_boundaries(block)), len(block.text)]
+    return [(a, b) for a, b in zip(cuts, cuts[1:]) if a < b]
+
+
+def inference_view(block: Block) -> tuple[Block, list[int | None]]:
+    """Readable model text with legacy-compatible persistent offsets."""
+    from dataclasses import replace
+    text, offsets = [], []
+    for index, (a, b) in enumerate(text_segments(block)):
+        if index:
+            text.append('\n')
+            offsets.append(None)
+        text.append(block.text[a:b])
+        offsets.extend(range(a, b))
+    return replace(block, text=''.join(text), node_paths=[]), offsets
+
+
+def map_detection(block: Block, detection: Detection) -> list[Detection]:
+    """Split at visible breaks without dropping model findings."""
+    from dataclasses import replace
+    view, offsets = inference_view(block)
+    if not 0 <= detection.start < detection.end <= len(view.text) or view.text[detection.start:detection.end] != detection.exact_text:
+        raise ValueError('Detector offsets do not match inference text')
+    groups: list[list[int]] = []
+    for offset in offsets[detection.start:detection.end]:
+        if offset is None:
+            groups.append([])
+        else:
+            if not groups:
+                groups.append([])
+            groups[-1].append(offset)
+    return [replace(detection, start=g[0], end=g[-1]+1,
+                    exact_text=block.text[g[0]:g[-1]+1]) for g in groups if g]

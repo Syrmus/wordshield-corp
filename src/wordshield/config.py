@@ -68,7 +68,7 @@ class Settings:
             allowed_user=os.getenv("WORDSHIELD_ALLOWED_USER", ""),
             trust_tailscale_headers=_bool("WORDSHIELD_TRUST_TAILSCALE_HEADERS", True),
             lm_base_url=os.getenv("WORDSHIELD_LM_BASE_URL", "http://127.0.0.1:1234/v1"),
-            lm_token=_lm_token(),
+            lm_token=_lm_token() if _bool('WORDSHIELD_QWEN_REQUIRED', True) else '',
             lm_model=os.getenv("WORDSHIELD_LM_MODEL", "qwen/qwen3-14b"),
             privacy_checkpoint=os.getenv(
                 "WORDSHIELD_PRIVACY_CHECKPOINT",

@@ -4,7 +4,7 @@ import json
 import os
 import sys
 from pathlib import Path
-from .models import Detection
+from .models import Detection, inference_view, map_detection
 from .detectors import DetectorUnavailable
 
 
@@ -70,16 +70,18 @@ class GlinerDetector:
                 for block in blocks:
                     if not block.text or block.id in (completed or set()):
                         continue
-                    payload = {"blocks": [{"id": block.id, "text": block.text}], "threshold": self.settings.gliner_threshold}
+                    view, _ = inference_view(block)
+                    payload = {"blocks": [{"id": block.id, "text": view.text}], "threshold": self.settings.gliner_threshold}
                     self.process.stdin.write((json.dumps(payload, ensure_ascii=False)+"\n").encode())
                     await self.process.stdin.drain()
                     result = await worker_response(self.process, inference_timeout([block]), 'Проверка русского текста')
                     if "error" in result:
                         raise DetectorUnavailable("Ошибка локального русского детектора")
                     chunk = [Detection(**d) for d in result["detections"]]
-                    if any(d.block_id != block.id or not 0 <= d.start < d.end <= len(block.text)
-                           or block.text[d.start:d.end] != d.exact_text for d in chunk):
+                    if any(d.block_id != block.id or not 0 <= d.start < d.end <= len(view.text)
+                           or view.text[d.start:d.end] != d.exact_text for d in chunk):
                         raise DetectorUnavailable("GLiNER: несовпадение диапазонов")
+                    chunk = [mapped for d in chunk for mapped in map_detection(block, d)]
                     found.extend(chunk)
                     if on_chunk:
                         on_chunk([block], chunk)
@@ -102,7 +104,8 @@ class SandboxedPrivacyDetector(GlinerDetector):
                 for chunk in privacy_chunks(blocks):
                     if all(b.id in (completed or set()) for b in chunk):
                         continue
-                    payload = {"blocks": [{"id": b.id, "text": b.text} for b in chunk]}
+                    views = {b.id: inference_view(b)[0] for b in chunk}
+                    payload = {"blocks": [{"id": b.id, "text": views[b.id].text} for b in chunk]}
                     self.process.stdin.write((json.dumps(payload, ensure_ascii=False)+"\n").encode())
                     await self.process.stdin.drain()
                     result = await worker_response(self.process, inference_timeout(chunk), 'Поиск персональных данных')
@@ -110,9 +113,10 @@ class SandboxedPrivacyDetector(GlinerDetector):
                         raise DetectorUnavailable("Ошибка локального Privacy Filter")
                     by_id = {b.id: b for b in chunk}
                     ds = [Detection(**d) for d in result["detections"]]
-                    if any(d.block_id not in by_id or not 0 <= d.start < d.end <= len(by_id[d.block_id].text)
-                           or by_id[d.block_id].text[d.start:d.end] != d.exact_text for d in ds):
+                    if any(d.block_id not in views or not 0 <= d.start < d.end <= len(views[d.block_id].text)
+                           or views[d.block_id].text[d.start:d.end] != d.exact_text for d in ds):
                         raise DetectorUnavailable("Privacy Filter: несовпадение диапазонов")
+                    ds = [mapped for d in ds for mapped in map_detection(by_id[d.block_id], d)]
                     found.extend(ds)
                     if on_chunk:
                         on_chunk(chunk, ds)

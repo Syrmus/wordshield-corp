@@ -5,9 +5,9 @@ from .ooxml import _safe_zip, _xml, _zip, W, UnsafeDocument, FORBIDDEN_LOCAL_TAG
 MC='http://schemas.openxmlformats.org/markup-compatibility/2006'
 
 
-def remove_images(raw):
+def remove_images(raw, *, previews_only=False):
     entries=_safe_zip(raw)
-    media={n for n in entries if n.startswith('word/media/')}
+    media={n for n in entries if (n.startswith('word/media/') and not previews_only) or n.lower().startswith('docprops/thumbnail.')}
     count=0
     changed=False
     for name,data in list(entries.items()):
@@ -21,6 +21,8 @@ def remove_images(raw):
                 raise UnsafeDocument(f'Неподдерживаемый объект в {name}')
         targets=[]
         for node in root.iter():
+            if previews_only:
+                break
             if node.tag not in {f'{{{W}}}drawing',f'{{{W}}}pict'}:
                 continue
             target=node
@@ -47,7 +49,7 @@ def remove_images(raw):
         if name.endswith('.rels'):
             root=_xml(data);removed=[]
             for rel in list(root):
-                if (rel.get('Type') or '').rsplit('/',1)[-1]=='image':
+                if (rel.get('Type') or '').rsplit('/',1)[-1] in ({'thumbnail'} if previews_only else {'image', 'thumbnail'}):
                     removed.append(rel.get('Id'));root.remove(rel)
             if removed:
                 entries[name]=etree.tostring(root,xml_declaration=True,encoding='UTF-8',standalone=True)

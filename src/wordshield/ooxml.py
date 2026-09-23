@@ -10,7 +10,7 @@ from urllib.parse import urlsplit, quote, unquote
 
 from lxml import etree
 
-from .models import Block, Finding
+from .models import Block, Finding, hard_boundaries
 
 W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 R = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
@@ -84,6 +84,8 @@ def _safe_zip(raw: bytes) -> dict[str, bytes]:
     total = 0
     result: dict[str, bytes] = {}
     for info in infos:
+        if info.filename in result or info.flag_bits & 1:
+            raise UnsafeDocument('Дублированная или зашифрованная часть DOCX')
         path = PurePosixPath(info.filename)
         if path.is_absolute() or ".." in path.parts or "\\" in info.filename:
             raise UnsafeDocument("Небезопасное имя части в DOCX")
@@ -115,6 +117,16 @@ def _xml(data: bytes) -> etree._Element:
 
 def _inspect(entries: dict[str, bytes]) -> None:
     for name in entries:
+        if name in FORBIDDEN_NAMES or name.startswith(FORBIDDEN_PREFIXES):
+            raise UnsafeDocument(f'Неподдерживаемое содержимое: {name}')
+        structural = name in {
+            '[Content_Types].xml', '_rels/.rels', 'word/styles.xml',
+            'word/stylesWithEffects.xml', 'word/settings.xml', 'word/webSettings.xml',
+            'word/fontTable.xml', 'word/numbering.xml',
+        } or bool(re.fullmatch(r'word/theme/theme\d+\.xml', name))
+        relationship = bool(re.fullmatch(r'(?:word|customXml)(?:/[^/]+)*/_rels/[^/]+\.rels', name))
+        if not (_is_text_part(name) or structural or relationship):
+            raise UnsafeDocument(f'Неподдерживаемая часть DOCX: {name}')
         if name in FORBIDDEN_NAMES or name.startswith(FORBIDDEN_PREFIXES):
             raise UnsafeDocument(f"Неподдерживаемое содержимое: {name}")
         lower = name.lower()
@@ -447,6 +459,8 @@ def patch_docx(
         if not block or not prior or block.text != prior.text:
             raise UnsafeDocument("Блок не совпадает с проанализированным оригиналом")
         ordered = sorted(items, key=lambda x: (x.start, x.end))
+        if any(f.start < boundary < f.end for f in ordered for boundary in hard_boundaries(block)):
+            raise UnsafeDocument('Старая замена пересекает перенос Word. Повторите анализ документа.')
         if any(a.end > b.start for a, b in pairwise(ordered)):
             raise UnsafeDocument("Перекрывающиеся подтверждённые диапазоны")
         root = _xml(entries[block.part])
@@ -467,7 +481,65 @@ def patch_docx(
             root, xml_declaration=True, encoding="UTF-8", standalone=True
         )
         changed.add(block.part)
-    return _zip(entries), changed
+    result = _zip(entries)
+    assert_expected_text(raw, result, findings)
+    return result, changed
+
+
+def assert_expected_text(before: bytes, after: bytes, findings: list[Finding]) -> None:
+    """Independently prove all text outside selected ranges is preserved."""
+    left, right = parse_docx(before), parse_docx(after)
+    original = {b.id: b for b in left.blocks}
+    actual = {b.id: b for b in right.blocks}
+    if original.keys() != actual.keys():
+        raise UnsafeDocument('Набор текстовых полей изменился при экспорте')
+    grouped: dict[str, list[Finding]] = {}
+    for finding in findings:
+        if finding.status == 'accepted' and finding.alias:
+            grouped.setdefault(finding.block_id, []).append(finding)
+    if grouped.keys() - original.keys():
+        raise UnsafeDocument('Замена ссылается на неизвестное поле')
+    for bid, block in original.items():
+        expected = block.text
+        boundaries = hard_boundaries(block)
+        edits = sorted(grouped.get(bid, []), key=lambda f: f.start, reverse=True)
+        for f in edits:
+            if not 0 <= f.start < f.end <= len(block.text) or block.text[f.start:f.end] != f.exact_text:
+                raise UnsafeDocument('Замена не совпадает с оригиналом')
+            replacement = _safe_hyperlink_target(block.text, f.alias) if block.kind == 'hyperlink' else f.alias
+            expected = expected[:f.start] + replacement + expected[f.end:]
+            delta = len(replacement) - (f.end-f.start)
+            boundaries = {boundary + delta if boundary >= f.end else boundary for boundary in boundaries}
+        if actual[bid].text != expected or hard_boundaries(actual[bid]) != boundaries:
+            raise UnsafeDocument('Текст или переносы вне выбранных замен изменились')
+    # Prove the XML outside authorised value slots is identical, too. Text-node
+    # redistribution is checked by the block proof above and Word integrity gate.
+    for part in left.entries:
+        if left.entries[part] == right.entries.get(part):
+            continue
+        if not part.endswith(('.xml', '.rels')):
+            raise UnsafeDocument('Изменена нетекстовая часть DOCX')
+        roots = [_xml(left.entries[part]), _xml(right.entries[part])]
+        for root in roots:
+            for bid in grouped:
+                block = original[bid]
+                if block.part != part:
+                    continue
+                nodes, attr = _resolve(root, block)
+                if attr:
+                    for node in nodes:
+                        if attr == '__wordshield_tail__':
+                            node.tail = 'ALLOWED'
+                        else:
+                            node.set(attr, 'ALLOWED')
+                elif block.kind != 'paragraph':
+                    for node in nodes:
+                        node.text = 'ALLOWED'
+            for node in list(root.iter()):
+                if node.tag in TEXT_TAGS:
+                    node.getparent().remove(node)
+        if etree.tostring(roots[0], method='c14n') != etree.tostring(roots[1], method='c14n'):
+            raise UnsafeDocument('OOXML вне разрешённых значений изменился')
 
 
 def replace_aliases(

@@ -63,7 +63,7 @@ def remaining_values(raw, values, aliases):
     markers = sorted({a for a in aliases if a},key=len,reverse=True)
     if markers:
         pattern = re.compile('|'.join(re.escape(a) for a in markers))
-        texts = [(pattern.sub('\uFFFC', text), boundaries)
+        texts = [(pattern.sub(lambda match: '\uFFFC' * len(match.group()), text), boundaries)
                  for text, boundaries in texts]
     return [v for v in set(values) if len(v.strip()) >= 2
             and any(next(occurrences(text, v, boundaries), None) is not None
@@ -77,13 +77,9 @@ def remaining_sensitive_fragments(raw, findings, aliases):
     alias_pattern = re.compile('|'.join(re.escape(alias) for alias in markers)) if markers else None
     texts = []
     for block in parsed.blocks:
-        text = alias_pattern.sub('\uFFFC', block.text) if alias_pattern else block.text
+        text = alias_pattern.sub(lambda match: '\uFFFC' * len(match.group()), block.text) if alias_pattern else block.text
         texts.append((text, hard_boundaries(block)))
 
-    ignored_org = {
-        'company', 'limited', 'ltd', 'llc', 'inc', 'corp', 'corporation',
-        'ооо', 'ао', 'пао', 'зао', 'оао', 'общество', 'ответственностью',
-    }
     fragments = set()
     for finding in findings:
         if finding.status != 'accepted':
@@ -94,13 +90,13 @@ def remaining_sensitive_fragments(raw, findings, aliases):
                 fragments.add(local)
             if len(domain) >= 8:
                 fragments.add(domain)
-        elif finding.entity_type in {'PERSON', 'ORG'}:
-            for word in re.findall(r"[A-Za-zА-Яа-яЁё][A-Za-zА-Яа-яЁё'’\-]{3,}", finding.exact_text):
-                if word.casefold() not in ignored_org:
-                    fragments.add(word)
+        # A single name/company word is not proof of a leak (e.g. Analytics).
+        # Exact replacement coverage is proved separately against the source.
+    # Only fragments adjoining an alias are evidence of a partial replacement.
+    # A common mailbox name/domain elsewhere is not sufficient evidence.
     return sorted(fragment for fragment in fragments if any(
-        next(occurrences(text, fragment, boundaries), None) is not None
-        for text, boundaries in texts
+        re.search(re.escape(fragment) + r'@?\uFFFC|\uFFFC@?' + re.escape(fragment), text)
+        for text, _ in texts
     ))
 
 

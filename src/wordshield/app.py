@@ -24,6 +24,8 @@ from .progress import ANALYSIS_PAGE
 from .review_ui import REVIEW_SCRIPT
 from .markdown_export import to_markdown
 from .export_names import export_name
+from .uploads import read_document_upload
+from .auth import BrowserAuth, COOKIE, LIFETIME
 
 
 class DecisionPatch(BaseModel):
@@ -41,13 +43,29 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
         page = page.replace("</header>", banner + "</header>")
     service = WordShieldService(cfg)
+    browser_auth = BrowserAuth(os.getenv('WORDSHIELD_AUTH_FILE'))
+    if settings is None and cfg.trust_tailscale_headers and not browser_auth.data:
+        raise RuntimeError('WORDSHIELD_AUTH_FILE is required for production')
     jobs: dict[str, asyncio.Task] = {}
+    analysis_slot = asyncio.Semaphore(1)
+    upload_slot = asyncio.Lock()
 
-    def launch(sid: str) -> None:
+    async def run_analysis(sid, preserve_decisions=False):
+        async with analysis_slot:
+            await service.analyze_session(sid, preserve_decisions=preserve_decisions)
+
+    def check_capacity():
+        if len(jobs) >= 4:
+            raise HTTPException(429, 'В очереди уже четыре файла. Дождитесь завершения анализа.',
+                                headers={'Retry-After': '30'})
+
+    def launch(sid: str, preserve_decisions=False) -> None:
         if sid in jobs and not jobs[sid].done():
             return
         service.store.update_state(sid, "detecting")
-        task = asyncio.create_task(service.analyze_session(sid))
+        service.store.update_stage(sid, 'queued', 0, 0)
+        preserve_decisions = preserve_decisions or bool(service.store.get_json(sid, 'findings_blob'))
+        task = asyncio.create_task(run_analysis(sid, preserve_decisions))
         jobs[sid] = task
 
         def finished(done: asyncio.Task) -> None:
@@ -60,6 +78,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
+        if cfg.render_required:
+            from .ram_workspace import cleanup_stale_workspaces
+            await asyncio.to_thread(cleanup_stale_workspaces)
         service.store.purge(cfg.upload_ttl_hours)
         for row in service.store.list():
             if row["state"] == "detecting":
@@ -89,16 +110,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
     app.state.service = service
 
-    async def read_upload(file: UploadFile) -> tuple[bytes, bytes]:
-        name = (file.filename or "").lower()
-        if not name.endswith((".docx", ".doc")):
-            raise HTTPException(415, "Поддерживаются .docx и .doc")
-        raw = await file.read(cfg.max_upload_bytes + 1)
-        if not raw:
-            raise HTTPException(422, "Файл пустой (0 байт). Выберите другой файл.")
+    async def read_upload(request: Request):
+        raw, filename, _ = await read_document_upload(request, cfg.max_upload_bytes)
+        name = filename.lower()
         if name.endswith(".doc"):
-            return await asyncio.to_thread(convert_doc, raw, cfg), raw
-        return raw, raw
+            return await asyncio.to_thread(convert_doc, raw, cfg), raw, filename
+        return raw, raw, filename
 
     @app.middleware("http")
     async def identity_gate(request: Request, call_next):
@@ -114,11 +131,36 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             expected = f"{request.url.scheme}://{request.url.netloc}"
             if request.headers["Origin"].rstrip("/") != expected.rstrip("/"):
                 return Response("Cross-site request rejected", 403)
+        if request.url.path != '/login' and not browser_auth.valid(request.cookies.get(COOKIE, '')):
+            return Response('Требуется вход', 401) if request.url.path.startswith('/api/') else RedirectResponse('/login', 303)
         response = await call_next(request)
         response.headers["Cache-Control"] = "no-store"
         # Native POST forms can receive Origin: null under no-referrer (Safari).
         # Keep same-origin form provenance while leaking nothing cross-origin.
         response.headers["Referrer-Policy"] = "same-origin"
+        response.headers['X-Content-Type-Options'] = 'nosniff'
+        response.headers['X-Frame-Options'] = 'DENY'
+        response.headers['Content-Security-Policy'] = "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; form-action 'self'; base-uri 'none'"
+        return response
+
+    @app.get('/login', response_class=HTMLResponse)
+    def login_page():
+        return page.replace('{{CONTENT}}', "<h1>Вход в WordShield</h1><p>Введите пароль доступа. На этом браузере вход сохранится на 30 дней.</p><form method='post' action='/login'><label>Пароль <input type='password' name='password' maxlength='256' autocomplete='current-password' required></label><button>Войти</button></form>")
+
+    @app.post('/login')
+    async def login(request: Request):
+        from urllib.parse import parse_qs
+        body = bytearray()
+        async for chunk in request.stream():
+            body.extend(chunk)
+            if len(body) > 4096:
+                raise HTTPException(413, 'Слишком большой запрос')
+        password = parse_qs(body.decode('utf-8', errors='replace')).get('password', [''])[0]
+        if not browser_auth.verify_password(password):
+            return HTMLResponse("<p>Неверный пароль или слишком много попыток. Повторите через пять минут.</p><a href='/login'>Вернуться</a>", 403)
+        response = RedirectResponse('/', 303)
+        response.set_cookie(COOKIE, browser_auth.issue(), max_age=LIFETIME, secure=True,
+                            httponly=True, samesite='strict', path='/')
         return response
 
     @app.exception_handler(UnsafeDocument)
@@ -249,7 +291,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if format not in {'docx','md'}:
             raise HTTPException(422, 'Выберите DOCX или MD')
         try:
-            output=service.store.result(sid)
+            if service.store._row(sid)['state'] != 'exported':
+                raise KeyError(sid)
+            output=service.export(sid)
             return markdown_response(sid,output) if format=='md' else docx_response(sid,output)
         except KeyError:
             raise HTTPException(404, "Результат не сохранён или срок сессии истёк")
@@ -442,11 +486,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.post("/api/sessions", status_code=202)
     async def create_session_endpoint(
-        file: Annotated[UploadFile, File()]
+        request: Request
     ):
-        raw, original = await read_upload(file)
-        sid = service.begin_session(raw, file.filename, original)
-        launch(sid)
+        if upload_slot.locked():
+            raise HTTPException(429, 'Другая загрузка ещё обрабатывается')
+        async with upload_slot:
+            check_capacity()
+            raw, original, filename = await read_upload(request)
+            sid = await asyncio.to_thread(service.begin_session, raw, filename, original)
+            launch(sid)
         return {
             "id": sid,
             "review_url": f"/sessions/{sid}",
@@ -455,11 +503,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.post("/upload")
     async def upload_page(
-        file: Annotated[UploadFile, File()]
+        request: Request
     ):
-        raw, original = await read_upload(file)
-        sid = service.begin_session(raw, file.filename, original)
-        launch(sid)
+        if upload_slot.locked():
+            raise HTTPException(429, 'Другая загрузка ещё обрабатывается')
+        async with upload_slot:
+            check_capacity()
+            raw, original, filename = await read_upload(request)
+            sid = await asyncio.to_thread(service.begin_session, raw, filename, original)
+            launch(sid)
         return RedirectResponse(f"/sessions/{sid}", status_code=303)
 
     @app.post("/sessions/{sid}/retry")
@@ -470,6 +522,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(404)
         if row["state"] != "failed" or not row["raw_blob"]:
             raise HTTPException(409, "Сессию нельзя продолжить")
+        check_capacity()
         launch(sid)
         return RedirectResponse(f"/sessions/{sid}", status_code=303)
 
@@ -481,8 +534,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(404)
         if row["state"] != "review" or not row["raw_blob"]:
             raise HTTPException(409, "Сессия не готова к уточнению")
-        service.store.update_state(sid, "detecting")
-        await service.analyze_session(sid, preserve_decisions=True)
+        check_capacity()
+        launch(sid, preserve_decisions=True)
         return RedirectResponse(f"/sessions/{sid}", status_code=303)
 
     @app.get("/api/sessions/{sid}/status")
@@ -524,12 +577,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return markdown_response(sid,output) if format=='md' else docx_response(sid,output)
 
     @app.post("/api/restore")
-    async def restore_endpoint(file: Annotated[UploadFile, File()], session_id: Annotated[str, Form()] = ""):
-        raw = await file.read(cfg.max_upload_bytes + 1)
-        try:
-            restored, report = service.restore(raw, session_id or None)
-        except KeyError:
-            raise HTTPException(404, "Сессия восстановления не найдена или истекла")
+    async def restore_endpoint(request: Request):
+        if upload_slot.locked():
+            raise HTTPException(429, 'Другая загрузка ещё обрабатывается')
+        async with upload_slot:
+            raw, _, session_id = await read_document_upload(request, cfg.max_upload_bytes, restoring=True)
+            try:
+                restored, report = await asyncio.to_thread(service.restore, raw, session_id or None)
+            except KeyError:
+                raise HTTPException(404, "Сессия восстановления не найдена или истекла")
         bundle = service.restore_bundle(restored, report)
         return Response(
             bundle,

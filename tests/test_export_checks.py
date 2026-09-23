@@ -90,4 +90,4 @@ def test_partial_email_and_name_fragments_block_export():
     org=finding(source,'Northbridge Analytics Ltd','ORG',start=31,id='org')
     leaked=remaining_sensitive_fragments(raw,[email,org],['[[PERSON-ABCD-001]]'])
     assert 'test.owner' in leaked
-    assert 'Northbridge' in leaked
+    assert 'Northbridge' not in leaked  # isolated company words are not proof of a leak

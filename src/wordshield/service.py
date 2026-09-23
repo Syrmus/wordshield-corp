@@ -20,7 +20,6 @@ from .config import Settings
 from .detectors import (
     DetectorUnavailable,
     PrivacyFilterDetector,
-    QwenDetector,
     RulesDetector,
     expand_approved_repetitions,
     merge_detections,
@@ -50,6 +49,8 @@ from .export_checks import (
 from .overlaps import widest_replacements
 from .technical_metadata import omit_technical_schemas
 from .image_removal import remove_images
+from .replacement_plan import compile_plan
+from .ram_workspace import ram_workspace
 
 ALIAS_RE = re.compile(r"\[\[([A-Z_]+)-([A-Z2-7]{4})-(\d{3,})(?::[^\[\]\r\n]{1,80})?\]\]")
 ENTITY_TYPES = {
@@ -93,7 +94,10 @@ class WordShieldService:
         self.dictionary = DictionaryStore(self.store)
         self.rules = RulesDetector()
         self.privacy = SandboxedPrivacyDetector(settings)
-        self.qwen = QwenDetector(settings)
+        self.qwen = None
+        if settings.qwen_required:
+            from .qwen_detector import QwenDetector
+            self.qwen = QwenDetector(settings)
         self.gliner = GlinerDetector(settings)
 
     def begin_session(self, raw: bytes, filename: str | None = None, original: bytes | None = None) -> str:
@@ -140,7 +144,9 @@ class WordShieldService:
                 "pipeline": hashlib.sha256(Path(__file__).with_name("detectors.py").read_bytes()).hexdigest(),
                 "gliner_adapter": hashlib.sha256(Path(__file__).with_name("local_worker.py").read_bytes()).hexdigest(),
                 "adapter": hashlib.sha256(Path(__file__).with_name("gliner_detector.py").read_bytes()).hexdigest(),
-                "schema": 3,
+                "document_adapter": hashlib.sha256(Path(__file__).with_name('models.py').read_bytes()).hexdigest(),
+                "parser": hashlib.sha256(Path(__file__).with_name('ooxml.py').read_bytes()).hexdigest(),
+                "schema": 4,
             }, sort_keys=True).encode()).hexdigest()
             meta = self.store.get_json(sid, "detector_blob") or {}
             if meta.get("fingerprint") != fingerprint:
@@ -298,7 +304,7 @@ class WordShieldService:
                                 and left.start < right.end and right.start < left.end:
                             left.status = right.status = "pending"
             findings = expand_approved_repetitions(parsed.blocks, findings, protected_ranges)
-            findings = widest_replacements(parsed.blocks, findings)
+            findings = compile_plan(parsed.blocks, findings)
             payload = {
                 "prefix": prefix,
                 "blocks": [b.__dict__ for b in parsed.blocks],
@@ -353,17 +359,8 @@ class WordShieldService:
             raise KeyError(sid)
         if self.store._row(sid)['state'] == 'exported':
             return payload
-        filtered = omit_technical_schemas([Block(**b) for b in payload['blocks']],
-                                         [Finding(**f) for f in payload['findings']])
-        if len(filtered) != len(payload['findings']):
-            payload['findings'] = [f.json() for f in filtered]
-            self.store.put_json(sid,'findings_blob',payload)
-        if any(f['entity_type']=='SECRET' and f['status']=='pending' for f in payload['findings']):
-            payload['findings'] = [f.json() for f in secret_defaults(
-                [Block(**b) for b in payload['blocks']], [Finding(**f) for f in payload['findings']])]
-            self.store.put_json(sid,'findings_blob',payload)
-        normalized = widest_replacements([Block(**b) for b in payload['blocks']],
-                                         [Finding(**f) for f in payload['findings']])
+        normalized = compile_plan([Block(**b) for b in payload['blocks']],
+                                  [Finding(**f) for f in payload['findings']])
         if [f.json() for f in normalized] != payload['findings']:
             payload['findings'] = [f.json() for f in normalized]
             self.store.put_json(sid, 'findings_blob', payload)
@@ -488,7 +485,7 @@ class WordShieldService:
                     finding.status = previous["status"]
                     finding.entity_type = previous["entity_type"]
         resolve_clear_document_id_overlaps(updated)
-        updated = widest_replacements([Block(**b) for b in payload['blocks']], updated)
+        updated = compile_plan([Block(**b) for b in payload['blocks']], updated)
         payload["findings"] = [finding.json() for finding in updated]
         self.store.put_json(sid, "findings_blob", payload)
         return payload
@@ -496,12 +493,12 @@ class WordShieldService:
     def _render(self, raw: bytes) -> None:
         if not self.settings.render_required:
             return
-        with tempfile.TemporaryDirectory(prefix="wordshield-render-") as tmp:
+        with ram_workspace() as tmp:
             source = Path(tmp) / "document.docx"
             out = Path(tmp) / "rendered"
             source.write_bytes(raw)
             out.mkdir()
-            env = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "HOME": tmp}
+            env = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "HOME": tmp, "TMPDIR": tmp}
             try:
                 proc = subprocess.run(
                     [
@@ -534,7 +531,9 @@ class WordShieldService:
         started = monotonic()
         if self.store._row(sid)["state"] == "exported":
             try:
-                return self.store.result(sid)
+                output = remove_images(self.store.result(sid), previews_only=True)[0]
+                parse_docx(output)
+                return output
             except KeyError:
                 raise UnsafeDocument("Результат старой сессии не сохранялся. Используйте ранее скачанный файл")
         if self.store._row(sid)["state"] != "review":
@@ -547,8 +546,7 @@ class WordShieldService:
         if any(f.status == "pending" for f in findings):
             raise UnsafeDocument("Сначала проверьте все сомнительные находки")
         blocks = [Block(**b) for b in payload['blocks']]
-        findings = add_exact_repeats(blocks, findings)
-        findings = widest_replacements(blocks, findings)
+        # findings() returns the persisted plan already shown in the review UI.
         accepted = [f for f in findings if f.status == "accepted"]
         overlapping = sum(
             a.block_id == b.block_id and a.start < b.end and b.start < a.end
@@ -613,6 +611,7 @@ class WordShieldService:
 
     def restore(self, raw: bytes, session_id: str | None = None) -> tuple[bytes, dict]:
         started = monotonic()
+        raw = remove_images(raw, previews_only=True)[0]
         parsed = parse_docx(raw)
         tokens = ALIAS_RE.findall("\n".join(b.text for b in parsed.blocks))
         tokens.extend(

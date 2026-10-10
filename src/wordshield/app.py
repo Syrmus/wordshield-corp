@@ -26,6 +26,10 @@ from .markdown_export import to_markdown
 from .export_names import export_name
 from .uploads import read_document_upload
 from .auth import BrowserAuth, COOKIE, LIFETIME
+from .accounts import Accounts
+from .tenants import TenantServices
+from .account_ui import install_account_routes
+from .replacement_options import CATEGORIES, LABELS, selected_types
 
 
 class DecisionPatch(BaseModel):
@@ -42,17 +46,25 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             f"<p>{html.escape(setup_label)}</p></details>"
         )
         page = page.replace("</header>", banner + "</header>")
-    service = WordShieldService(cfg)
+    base_service = WordShieldService(cfg)
     browser_auth = BrowserAuth(os.getenv('WORDSHIELD_AUTH_FILE'))
     if settings is None and cfg.trust_tailscale_headers and not browser_auth.data:
         raise RuntimeError('WORDSHIELD_AUTH_FILE is required for production')
+    users_enabled = os.getenv('WORDSHIELD_USERS_ENABLED', '').lower() in {'1','true','yes'}
+    if users_enabled and not browser_auth.data:
+        raise RuntimeError('User accounts require a provisioned WORDSHIELD_AUTH_FILE')
+    accounts = Accounts(cfg.data_dir, browser_auth.data) if users_enabled else None
+    tenants = TenantServices(base_service, accounts)
+    service = tenants if accounts else base_service
+    if accounts:
+        page = page.replace('</nav>', "<a class='nav-link' href='/account'>👤 Личный кабинет</a></nav>")
     jobs: dict[str, asyncio.Task] = {}
     analysis_slot = asyncio.Semaphore(1)
     upload_slot = asyncio.Lock()
 
-    async def run_analysis(sid, preserve_decisions=False):
+    async def run_analysis(owner_service, sid, preserve_decisions=False):
         async with analysis_slot:
-            await service.analyze_session(sid, preserve_decisions=preserve_decisions)
+            await owner_service.analyze_session(sid, preserve_decisions=preserve_decisions)
 
     def check_capacity():
         if len(jobs) >= 4:
@@ -65,7 +77,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         service.store.update_state(sid, "detecting")
         service.store.update_stage(sid, 'queued', 0, 0)
         preserve_decisions = preserve_decisions or bool(service.store.get_json(sid, 'findings_blob'))
-        task = asyncio.create_task(run_analysis(sid, preserve_decisions))
+        owner_service = tenants.selected.get() if accounts else base_service
+        task = asyncio.create_task(run_analysis(owner_service, sid, preserve_decisions))
         jobs[sid] = task
 
         def finished(done: asyncio.Task) -> None:
@@ -81,15 +94,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if cfg.render_required:
             from .ram_workspace import cleanup_stale_workspaces
             await asyncio.to_thread(cleanup_stale_workspaces)
-        service.store.purge(cfg.upload_ttl_hours)
-        for row in service.store.list():
-            if row["state"] == "detecting":
-                launch(row["id"])
+        for owner_service in tenants.all():
+            owner_service.store.purge(cfg.upload_ttl_hours)
+            token = tenants.selected.set(owner_service)
+            try:
+                for row in owner_service.store.list():
+                    if row["state"] == "detecting":
+                        launch(row["id"])
+            finally:
+                tenants.selected.reset(token)
 
         async def cleaner():
             while True:
                 await asyncio.sleep(3600)
-                service.store.purge(cfg.upload_ttl_hours)
+                for owner_service in tenants.all():
+                    owner_service.store.purge(cfg.upload_ttl_hours)
 
         task = asyncio.create_task(cleaner())
         try:
@@ -102,20 +121,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 job.cancel()
             if jobs:
                 await asyncio.gather(*jobs.values(), return_exceptions=True)
-            await service.gliner.close()
-            await service.privacy.close()
+            await base_service.gliner.close()
+            await base_service.privacy.close()
 
     app = FastAPI(
         title="WordShield Local", docs_url=None, redoc_url=None, lifespan=lifespan
     )
-    app.state.service = service
+    app.state.service = base_service
+    app.state.accounts = accounts
+    app.state.tenants = tenants
 
     async def read_upload(request: Request):
-        raw, filename, _ = await read_document_upload(request, cfg.max_upload_bytes)
+        raw, filename, options = await read_document_upload(request, cfg.max_upload_bytes)
         name = filename.lower()
         if name.endswith(".doc"):
-            return await asyncio.to_thread(convert_doc, raw, cfg), raw, filename
-        return raw, raw, filename
+            return await asyncio.to_thread(convert_doc, raw, cfg), raw, filename, options
+        return raw, raw, filename, options
 
     @app.middleware("http")
     async def identity_gate(request: Request, call_next):
@@ -131,9 +152,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             expected = f"{request.url.scheme}://{request.url.netloc}"
             if request.headers["Origin"].rstrip("/") != expected.rstrip("/"):
                 return Response("Cross-site request rejected", 403)
-        if request.url.path != '/login' and not browser_auth.valid(request.cookies.get(COOKIE, '')):
+        if request.method not in {'GET','HEAD','OPTIONS'} and request.headers.get('Sec-Fetch-Site') == 'cross-site':
+            return Response('Cross-site request rejected',403)
+        user = accounts.current(request.cookies.get(COOKIE,'')) if accounts else None
+        authenticated = bool(user) if accounts else browser_auth.valid(request.cookies.get(COOKIE,''))
+        public = {'/login', '/register', '/favicon.svg'} if accounts else {'/login'}
+        if request.url.path not in public and not authenticated:
             return Response('Требуется вход', 401) if request.url.path.startswith('/api/') else RedirectResponse('/login', 303)
-        response = await call_next(request)
+        request.state.user = user
+        token = tenants.selected.set(tenants.for_user(user)) if user else None
+        try:
+            response = await call_next(request)
+        finally:
+            if token is not None:
+                tenants.selected.reset(token)
         response.headers["Cache-Control"] = "no-store"
         # Native POST forms can receive Origin: null under no-referrer (Safari).
         # Keep same-origin form provenance while leaking nothing cross-origin.
@@ -143,11 +175,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         response.headers['Content-Security-Policy'] = "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; form-action 'self'; base-uri 'none'"
         return response
 
-    @app.get('/login', response_class=HTMLResponse)
+    if accounts:
+        install_account_routes(app, accounts, page)
+
     def login_page():
         return page.replace('{{CONTENT}}', "<h1>Вход в WordShield</h1><p>Введите пароль доступа. На этом браузере вход сохранится на 30 дней.</p><form method='post' action='/login'><label>Пароль <input type='password' name='password' maxlength='256' autocomplete='current-password' required></label><button>Войти</button></form>")
 
-    @app.post('/login')
     async def login(request: Request):
         from urllib.parse import parse_qs
         body = bytearray()
@@ -162,6 +195,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         response.set_cookie(COOKIE, browser_auth.issue(), max_age=LIFETIME, secure=True,
                             httponly=True, samesite='strict', path='/')
         return response
+
+    if not accounts:
+        app.add_api_route('/login', login_page, methods=['GET'], response_class=HTMLResponse)
+        app.add_api_route('/login', login, methods=['POST'])
 
     @app.exception_handler(UnsafeDocument)
     async def unsafe_handler(_: Request, exc: UnsafeDocument):
@@ -186,7 +223,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return {"status": "ok", "model": cfg.lm_model if cfg.qwen_required else None,
                 "detectors": ["rules"] + (["gliner-ru"] if cfg.gliner_required else [])
                     + (["privacy-filter"] if cfg.privacy_required else [])
-                    + (["qwen"] if cfg.qwen_required else []), "cloud_fallback": False}
+                    + (["qwen"] if cfg.qwen_required else []), "cloud_fallback": False,
+                "users_enabled": bool(accounts)}
 
     @app.get("/", response_class=HTMLResponse)
     def home():
@@ -317,9 +355,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return page.replace("{{CONTENT}}", "<h1>Постоянные замены</h1><p>Применяются автоматически к новым загрузкам. "
                             "Совпадение точное, с учётом регистра и границ слов; падежные формы добавляйте отдельно. "
                             "Более длинная запись имеет приоритет.</p><p>В названии замены пишите обычный текст — например, «Компания 1» или «Заказчик». "
-                            "Скобки, код и номер сервис добавит сам. Можно оставить поле пустым — обозначение будет выбрано автоматически. "
+                            "Скобки и номер сервис добавит сам: например, [Заказчик_1]. Можно оставить поле пустым — обозначение будет выбрано автоматически на языке сессии. "
                             "Не используйте в названии реальные чувствительные данные: оно будет видно в обезличенном файле.</p>"
-                            "<p>Словарь зашифрован и хранится до удаления записей. Изменения не затрагивают ранее загруженные документы. "
+                            "<p>Правило применяется, только если его тип выбран при загрузке. Словарь зашифрован и хранится до удаления записей. Изменения не затрагивают ранее загруженные документы. "
                             "Для восстановления файла только с постоянными алиасами выберите его сессию.</p>"
                             + editor() + "".join(editor(e) for e in service.dictionary.list()))
 
@@ -377,7 +415,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     f"<h1>Анализ не завершён</h1><p>Причина: {html.escape(status['error_code'] or 'локальный детектор не ответил')}.</p><p>Прогресс сохранён. При продолжении уже проверенные фрагменты будут использованы повторно.</p><form action='/sessions/{sid}/retry' method='post'><button>Продолжить анализ</button></form><form action='/sessions/{sid}/delete' method='post'><button class='danger'>Удалить сессию</button></form>",
                 )
             raise HTTPException(404)
-        removed_images = (service.store.get_json(sid, 'metadata_blob') or {}).get('removed_images',0)
+        metadata = service.store.get_json(sid, 'metadata_blob') or {}
+        removed_images = metadata.get('removed_images',0)
+        options = metadata.get('replacement_options')
+        option_notice = ''
+        available_types = [t for t in ENTITY_TYPES if t in selected_types(options)]
+        if options:
+            names = ', '.join(label for key,label,_ in CATEGORIES if key in options['categories'])
+            example = '[ФИО_1], [адрес_1]' if options['language']=='ru' else '[Name_1], [Address_1]'
+            option_notice = '<details><summary>Что заменяем в этой сессии</summary><p>'+html.escape(names)+'</p><p>Плейсхолдеры: '+example+'. Невыбранные категории остаются в документе.</p></details>'
         image_notice = ("<p>Изображения удалены из рабочей копии и будут заменены пометками в обоих форматах экспорта. Оригинал сохранён отдельно. При восстановлении по алиасам картинки не возвращаются.</p>" if removed_images else '')
         pending = [f for f in data["findings"] if f["status"] == "pending"]
         overlaps = [
@@ -442,19 +488,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         "<span class='switch-track' aria-hidden='true'></span>"
                         "<span class='switch-on'>Заменить</span><span class='switch-off'>Пропустить</span></label>")
             return "".join(
-                f"<tr data-id='{html.escape(f['id'])}'><td><select>{''.join(f'<option value={t}' + (' selected' if t == f['entity_type'] else '') + f'>{t}</option>' for t in ENTITY_TYPES)}</select></td><td><div class='target'><b>Фрагмент:</b> {html.escape(f['exact_text'])}</div><small>Контекст для ориентира (не весь будет заменён): {html.escape(f['context'])}</small></td><td>{html.escape(', '.join(f['sources']))}<small>{html.escape(note(f))}</small></td><td>{toggle(f)}</td></tr>"
+                f"<tr data-id='{html.escape(f['id'])}'><td><select>{''.join(f'<option value={t}' + (' selected' if t == f['entity_type'] else '') + f'>{t}</option>' for t in dict.fromkeys([*available_types, f['entity_type']]))}</select></td><td><div class='target'><b>Фрагмент:</b> {html.escape(f['exact_text'])}</div><small>Контекст для ориентира (не весь будет заменён): {html.escape(f['context'])}</small></td><td>{html.escape(', '.join(f['sources']))}<small>{html.escape(note(f))}</small></td><td>{toggle(f)}</td></tr>"
                 for f in items
             )
 
         accepted = [f for f in data["findings"] if f["status"] != "pending"]
-        content = f"""<h1>Нужно проверить</h1>{image_notice}<p>Сомнительных: <strong>{len(pending)}</strong>. Пересекающиеся варианты автоматически объединяются в один широкий фрагмент. Подтверждённые замены доступны ниже.</p>
+        content = f"""<h1>Нужно проверить</h1>{image_notice}{option_notice}<p>Сомнительных: <strong>{len(pending)}</strong>. Пересекающиеся варианты автоматически объединяются в один широкий фрагмент. Подтверждённые замены доступны ниже.</p>
         <table id='findings'><tr><th>Тип</th><th>Точный фрагмент и контекст</th><th>Источники</th><th>Решение</th></tr>{rows(pending)}</table>
         <p>Переключатели сохраняются автоматически. Серый — оставить данные в документе, зелёный — заменить. При экспорте текущий выбор сохраняется ещё раз; нетронутые серые находки пропускаются.</p>
         <p>При экспорте также скрываются точные повторы подтверждённых значений, в том числе в свойствах файла и комментариях. Явно пропущенное повторение того же значения не заменяется автоматически.</p>
         <style>.decision-switch{{display:inline-flex;align-items:center;gap:9px;cursor:pointer;position:relative;white-space:nowrap;min-height:44px}}.decision-switch input{{position:absolute;width:1px;height:1px;opacity:0}}.switch-track{{display:inline-block;width:51px;height:31px;border-radius:20px;background:#8e949b;position:relative;transition:background .15s;flex-shrink:0}}.switch-track::after{{content:'';position:absolute;width:27px;height:27px;top:2px;left:2px;background:white;border-radius:50%;box-shadow:0 1px 3px #0003;transition:transform .15s}}.decision-switch input:checked ~ .switch-track{{background:#248a3d}}.decision-switch input:checked ~ .switch-track::after{{transform:translateX(20px)}}.decision-switch input:focus-visible ~ .switch-track{{outline:3px solid #174f86;outline-offset:3px}}.switch-on{{display:none}}.decision-switch input:checked ~ .switch-on{{display:inline}}.decision-switch input:checked ~ .switch-off{{display:none}}</style>
         <details><summary>Все остальные находки ({len(accepted)})</summary><table>{rows(accepted)}</table></details>
         <details class='manual-addition'><summary>Не всё найдено? Добавить вручную</summary><p>Если сервис пропустил чувствительные данные, вставьте их точное написание из документа. Все точные повторения будут добавлены для замены.</p>
-        <input id='manual-text' placeholder='Точный фрагмент'><select id='manual-type'>{"".join(f"<option>{t}</option>" for t in ENTITY_TYPES)}</select>
+        <input id='manual-text' placeholder='Точный фрагмент'><select id='manual-type'>{"".join(f"<option>{t}</option>" for t in available_types)}</select>
         <button id='add-fragment'>Добавить фрагмент</button></details><p id='save-status' role='status' aria-live='polite'>Изменения сохраняются автоматически</p>
         <form id='export-form' action='/api/sessions/{sid}/export' method='post'><button type='submit' data-format='docx'>Скачать Word (.docx)</button> <button type='submit' data-format='md'>Скачать Markdown (.md)</button></form>
         <p><small>Markdown — текст для проверки нейросетью, без исходной вёрстки. Таблицы представлены строками и ячейками, автоматические списки — маркерами. Обратное восстановление пока принимает только DOCX.</small></p>
@@ -464,7 +510,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/help", response_class=HTMLResponse)
     def help_page():
-        return page.replace("{{CONTENT}}", HELP_CONTENT)
+        account_help = ("<section><h2>👤 Ваш кабинет</h2><p>Войдите со своим логином и паролем. "
+                        "В «Моих сессиях» — только ваши файлы; список постоянных замен тоже личный. "
+                        "Пароль можно изменить в разделе «Личный кабинет».</p><p>Если аккаунта нет, "
+                        "нажмите «Зарегистрироваться» на странице входа и попросите администратора одобрить заявку. "
+                        "Администратор также может создать аккаунт и передать вам данные входа. "
+                        "При потере пароля обратитесь к нему.</p></section>") if accounts else ''
+        return page.replace("{{CONTENT}}", HELP_CONTENT + account_help)
 
     @app.get("/restore", response_class=HTMLResponse)
     def restore_page(session_id: str = ""):
@@ -479,7 +531,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "{{CONTENT}}",
             "<h1>Восстановить файл</h1><p>Загрузите исправленный обезличенный DOCX. "
             "Вернётся ZIP с документом и точным отчётом.</p>"
-            + "<label>Сессия (обязательна, если в файле только постоянные алиасы)<select id='restore-session' name='session_id' form='upload-form'>"
+            + "<p>Для [ФИО_1], [Name_1] и других коротких плейсхолдеров обязательно выберите исходную сессию. Надёжнее открывать восстановление из карточки нужного документа.</p><label>Исходная сессия<select id='restore-session' name='session_id' form='upload-form'>"
             + "".join(options) + "</select></label>"
             + upload_widget("/api/restore", "Восстановить", cfg.max_upload_bytes),
         )
@@ -492,8 +544,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(429, 'Другая загрузка ещё обрабатывается')
         async with upload_slot:
             check_capacity()
-            raw, original, filename = await read_upload(request)
-            sid = await asyncio.to_thread(service.begin_session, raw, filename, original)
+            raw, original, filename, options = await read_upload(request)
+            sid = await asyncio.to_thread(service.begin_session, raw, filename, original, options)
             launch(sid)
         return {
             "id": sid,
@@ -509,8 +561,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(429, 'Другая загрузка ещё обрабатывается')
         async with upload_slot:
             check_capacity()
-            raw, original, filename = await read_upload(request)
-            sid = await asyncio.to_thread(service.begin_session, raw, filename, original)
+            raw, original, filename, options = await read_upload(request)
+            sid = await asyncio.to_thread(service.begin_session, raw, filename, original, options)
             launch(sid)
         return RedirectResponse(f"/sessions/{sid}", status_code=303)
 
@@ -623,6 +675,7 @@ ENTITY_TYPES = (
     "REG_ID",
     "DOCUMENT_ID",
     "PASSPORT",
+    "PERSONAL_ID",
     "DATE",
     "TIME",
     "SECRET",
@@ -639,7 +692,21 @@ def upload_widget(action: str, button: str, max_bytes: int) -> str:
         .replace("{{FORMATS}}", "DOCX" if action == "/api/restore" else "DOC или DOCX")
         .replace("{{ACCEPT}}", ".docx" if action == "/api/restore" else ".doc,.docx")
         .replace("{{ALLOW_DOC}}", "false" if action == "/api/restore" else "true")
+        .replace("{{OPTIONS}}", '' if action == '/api/restore' else replacement_options_widget())
     )
+
+
+def replacement_options_widget():
+    choices = ''.join(f"<label><input type='checkbox' name='category' value='{key}' checked> {html.escape(label)}</label>" for key,label,_ in CATEGORIES)
+    return ("<section class='replacement-options'><h2>Что заменить плейсхолдерами?</h2>"
+            "<p>Снимите галочки с данных, которые нужно оставить. По умолчанию выбраны все категории.</p>"
+            "<div class='actions'><button type='button' id='categories-all'>Выбрать все</button><button type='button' id='categories-none'>Снять все</button></div>"
+            "<fieldset class='category-grid'><legend>Типы данных</legend>"+choices+"</fieldset>"
+            "<label>Язык плейсхолдеров<select id='placeholder-language' name='placeholder_language'><option value='ru' selected>Русский</option><option value='en'>English</option></select></label>"
+            "<p id='placeholder-preview'>Пример: [ФИО_1], [компания_1], [адрес_1]</p>"
+            "<p><small>Язык документа менять не будем. Повторы получают одинаковый плейсхолдер; разные падежные формы — отдельные. Пользовательские названия из постоянных замен сохраняются.</small></p>"
+            "<p id='category-warning' role='status' hidden>⚠️ Невыбранные типы данных могут остаться в файле. Модели иногда ошибаются в типе: проверьте находки перед отправкой.</p></section>"
+            "<style>.replacement-options{text-align:left;border:1px solid var(--line);border-radius:12px;padding:20px;margin:20px 0}.replacement-options h2{margin-top:0}.category-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;border:0;padding:16px 0;margin:12px 0}.category-grid legend{position:absolute;width:1px;height:1px;overflow:hidden}.category-grid label{display:flex;align-items:flex-start;gap:7px;color:var(--ink)}.category-grid input{margin-top:4px;flex-shrink:0}.replacement-options .actions button{padding:7px 12px}#category-warning{background:#fff5df;padding:12px;border-radius:8px}@media(max-width:900px){.category-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}@media(max-width:520px){.category-grid{grid-template-columns:1fr}}</style>")
 
 
 UPLOAD_WIDGET = """
@@ -652,6 +719,7 @@ UPLOAD_WIDGET = """
     <span class='file-picker'><span aria-hidden='true'>Выбрать файл</span><input id='docx-file' type='file' name='file' aria-label='Выбрать файл' accept='{{ACCEPT}}' required></span>
     <span id='selected-file' class='selected-file'>Файл не выбран</span>
   </div>
+  {{OPTIONS}}
   <button id='upload-button' type='submit'>{{BUTTON}}</button>
   <p id='upload-status' role='status' aria-live='polite'></p>
 </form>
@@ -668,6 +736,19 @@ UPLOAD_WIDGET = """
   form.noValidate = true;
   const maxBytes = {{MAX_BYTES}};
   const allowDoc = {{ALLOW_DOC}};
+  const categories = Array.from(form.querySelectorAll('input[name=category]'));
+  const language = document.getElementById('placeholder-language');
+  const updateOptions = () => {
+    const warning = document.getElementById('category-warning');
+    if (warning) warning.hidden = categories.every(item => item.checked);
+    const preview = document.getElementById('placeholder-preview');
+    if (preview) preview.textContent = language.value === 'en' ? 'Пример: [Name_1], [Company_1], [Address_1]' : 'Пример: [ФИО_1], [компания_1], [адрес_1]';
+  };
+  categories.forEach(item => item.addEventListener('change', updateOptions));
+  language?.addEventListener('change', updateOptions);
+  for (const [id, checked] of [['categories-all', true], ['categories-none', false]]) {
+    document.getElementById(id)?.addEventListener('click', () => { categories.forEach(item => item.checked = checked); updateOptions(); });
+  }
   const isFileDrag = event => Boolean(event.dataTransfer && (
     event.dataTransfer.files?.length ||
     Array.from(event.dataTransfer.types || []).some(type => type.toLowerCase() === 'files') ||
@@ -739,6 +820,7 @@ UPLOAD_WIDGET = """
     if (uploading) return;
     const error = validate(selectedFile ? [selectedFile] : []);
     if (error) { status.textContent = error; return; }
+    if (categories.length && !categories.some(item => item.checked)) { status.textContent = 'Выберите хотя бы один тип данных.'; return; }
     uploading = true;
     submit.disabled = input.disabled = true;
     status.textContent = /\\.doc$/i.test(selectedFile.name)
@@ -750,6 +832,7 @@ UPLOAD_WIDGET = """
       const restoring = form.getAttribute('action') === '/api/restore';
       const session = document.getElementById('restore-session');
       if (restoring && session?.value) data.append('session_id', session.value);
+      if (!restoring) data.append('options', JSON.stringify({language: language.value, categories: categories.filter(item => item.checked).map(item => item.value)}));
       const response = await fetch(restoring ? '/api/restore' : '/api/sessions', {
         method: 'POST', body: data, credentials: 'same-origin'
       });

@@ -19,6 +19,7 @@ def main():
     parser.add_argument('--fixture', type=Path, required=True)
     parser.add_argument('--old-export', type=Path)
     parser.add_argument('--old-session')
+    parser.add_argument('--username', default='')
     args = parser.parse_args()
     base = args.base.rstrip('/')
     opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
@@ -29,7 +30,7 @@ def main():
         with opener.open(urllib.request.Request(base+path, data=data, headers=headers), timeout=timeout) as response:
             return response.read()
     password = args.credential.read_text().splitlines()[-1]
-    request('/login', urllib.parse.urlencode({'password': password}).encode(), 'application/x-www-form-urlencoded')
+    request('/login', urllib.parse.urlencode({'username': args.username, 'password': password}).encode(), 'application/x-www-form-urlencoded')
     print(json.dumps({'phase': 'authenticated'}), flush=True)
     def upload(path, raw, filename, sid=None):
         boundary = 'WordShieldTest' + uuid.uuid4().hex

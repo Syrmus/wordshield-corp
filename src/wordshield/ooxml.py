@@ -52,13 +52,13 @@ SENSITIVE_ATTRIBUTES = {
 }
 MAX_UNCOMPRESSED = 100 * 1024 * 1024
 MAX_ENTRIES = 2000
-ALIAS_TOKEN_RE = re.compile(r"\[\[([A-Z_]+-[A-Z2-7]{4}-\d{3,}(?::[^\[\]\r\n]{1,80})?)\]\]")
+ALIAS_TOKEN_RE = re.compile(r"\[\[([A-Z_]+-[A-Z2-7]{4}-\d{3,}(?::[^\[\]\r\n]{1,80})?)\]\]|(?<!\[)\[([^\[\]\r\n]{1,80}_[1-9]\d*)\](?!\])")
 SAFE_MAILTO_RE = re.compile(
-    r"mailto:wordshield-([A-Z_]+-[A-Z2-7]{4}-\d{3,}(?:%3A[^/@?#]+)?)@wordshield\.invalid",
+    r"mailto:wordshield-([^/@?#]+)@wordshield\.invalid",
     re.IGNORECASE,
 )
 SAFE_WEB_RE = re.compile(
-    r"https://wordshield\.invalid/a/([A-Z_]+-[A-Z2-7]{4}-\d{3,}(?:%3A[^/@?#]+)?)",
+    r"https://wordshield\.invalid/a/([^/@?#]+)",
     re.IGNORECASE,
 )
 
@@ -329,7 +329,7 @@ def _safe_hyperlink_target(original: str, alias: str) -> str:
     match = ALIAS_TOKEN_RE.fullmatch(alias)
     if not match:
         raise UnsafeDocument("Некорректный алиас внешней ссылки")
-    token = quote(match.group(1), safe='-_')
+    token = quote(match.group(1) or 'v2~'+match.group(2), safe='-_')
     scheme = urlsplit(original).scheme.lower()
     if scheme == "mailto":
         return f"mailto:wordshield-{token}@wordshield.invalid"
@@ -342,6 +342,9 @@ def hyperlink_alias(target: str) -> str | None:
     for pattern in (SAFE_MAILTO_RE, SAFE_WEB_RE):
         if match := pattern.fullmatch(target):
             token = unquote(match.group(1))
+            if token.startswith('v2~'):
+                alias = '[' + token[3:] + ']'
+                return alias if ALIAS_TOKEN_RE.fullmatch(alias) else None
             base, sep, label = token.partition(':')
             alias = f"[[{base.upper()}{sep}{label}]]"
             return alias if ALIAS_TOKEN_RE.fullmatch(alias) else None
@@ -552,7 +555,7 @@ def replace_aliases(
     entries = dict(parsed.entries)
     by_part: dict[str, list[Block]] = {}
     for block in parsed.blocks:
-        if "[[" in block.text or (block.kind == "hyperlink" and hyperlink_alias(block.text)):
+        if "[" in block.text or (block.kind == "hyperlink" and hyperlink_alias(block.text)):
             by_part.setdefault(block.part, []).append(block)
     for part, blocks in by_part.items():
         root = _xml(entries[part])

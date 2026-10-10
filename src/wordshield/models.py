@@ -18,6 +18,7 @@ EntityType = Literal[
     "REG_ID",
     "DOCUMENT_ID",
     "PASSPORT",
+    "PERSONAL_ID",
     "DATE",
     "TIME",
     "SECRET",

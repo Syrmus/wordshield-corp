@@ -27,6 +27,10 @@
 
 ## Administrative isolation (operator step)
 
+**Cancelled by the owner on 2026-09-23. Do not run this migration without new
+authorization.** WordShield remains under `service-account`. The following describes
+the prepared optional tooling, not the deployed configuration.
+
 `tools/isolate_service.py --agent <existing-launch-agent.plist> --check` performs
 read-only preflight. The same command without `--check`, run with sudo, prepares
 a hidden `_wordshield` service account and root-owned runtime, verifies imports,
@@ -77,5 +81,5 @@ guarantees execution of the chosen replacements, not completeness of detection.
 RAM workspaces do not promise protection from privileged memory inspection or
 swap; host FileVault and OS access control remain relevant. Backup exclusion does
 not erase pre-existing backups. Browser authentication alone does not isolate
-processes running under the service's own OS account: finish the administrative
-migration to separate WordShield from the bot account.
+processes running under the service's own OS account. OS-account separation was
+declined; this residual risk remains. Application user accounts do not change it.

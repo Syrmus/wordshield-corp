@@ -50,6 +50,7 @@ from .overlaps import widest_replacements
 from .technical_metadata import omit_technical_schemas
 from .image_removal import remove_images
 from .replacement_plan import compile_plan
+from .replacement_options import validate_options, selected_types, selected_findings, short_aliases
 from .ram_workspace import ram_workspace
 
 ALIAS_RE = re.compile(r"\[\[([A-Z_]+)-([A-Z2-7]{4})-(\d{3,})(?::[^\[\]\r\n]{1,80})?\]\]")
@@ -68,6 +69,7 @@ ENTITY_TYPES = {
     "REG_ID",
     "DOCUMENT_ID",
     "PASSPORT",
+    "PERSONAL_ID",
     "DATE",
     "TIME",
     "SECRET",
@@ -100,20 +102,25 @@ class WordShieldService:
             self.qwen = QwenDetector(settings)
         self.gliner = GlinerDetector(settings)
 
-    def begin_session(self, raw: bytes, filename: str | None = None, original: bytes | None = None) -> str:
+    def begin_session(self, raw: bytes, filename: str | None = None, original: bytes | None = None, options: dict | None = None) -> str:
+        # Omitted options preserve the pre-v2 Python integration; HTTP uploads
+        # always supply validated v2 defaults. Existing sessions never migrate.
+        options = validate_options(options) if options is not None else None
         if len(raw) > self.settings.max_upload_bytes:
             raise UnsafeDocument("Файл превышает допустимый размер")
         source = original if original is not None else raw
         raw, removed_images = remove_images(raw)
         parsed = parse_docx(raw)
-        if any(ALIAS_RE.search(b.text) or (b.kind == "hyperlink" and hyperlink_alias(b.text)) for b in parsed.blocks):
+        from .ooxml import ALIAS_TOKEN_RE
+        if any(ALIAS_TOKEN_RE.search(b.text) or (b.kind == "hyperlink" and hyperlink_alias(b.text)) for b in parsed.blocks):
             raise UnsafeDocument("В документе уже есть алиасы WordShield. Используйте восстановление, а не повторный анализ")
         sid, _ = self.store.create(raw, self.settings.retention_days)
         # Names and dictionary snapshots can themselves contain PII.
         filename = (filename or "").replace("\\", "/").split("/")[-1]
         filename = "".join(c for c in filename if c.isprintable())[:240] or None
         self.store.put_json(sid, "metadata_blob", {"filename": filename,
-                            "dictionary": self.dictionary.list(), "removed_images": removed_images})
+                            "dictionary": self.dictionary.list(), "removed_images": removed_images,
+                            "replacement_options": options})
         if source != raw:
             self.store.put_original(sid, source)
         self.store.update_state(sid, "detecting")
@@ -253,9 +260,14 @@ class WordShieldService:
                 await self.gliner.detect(parsed.blocks, done, record_gliner)
                 detections.extend(Detection(**d) for d in cache["detections"])
             self.store.update_stage(sid, "combining", total, total)
-            findings = merge_detections(parsed.blocks, detections)
             metadata = self.store.get_json(sid, "metadata_blob") or {}
-            findings = apply_dictionary(parsed.blocks, findings, metadata.get("dictionary", []))
+            options = metadata.get('replacement_options')
+            types = selected_types(options)
+            # Resolve specific types before filtering: e.g. a recognised SNILS
+            # must not turn into PHONE just because personal IDs were unchecked.
+            findings = merge_detections(parsed.blocks, detections)
+            findings = selected_findings(findings, options)
+            findings = apply_dictionary(parsed.blocks, findings, [e for e in metadata.get("dictionary", []) if e['entity_type'] in types])
             protected_ranges = []
             if preserve_decisions:
                 old_payload = self.store.get_json(sid, "findings_blob")
@@ -304,11 +316,12 @@ class WordShieldService:
                                 and left.start < right.end and right.start < left.end:
                             left.status = right.status = "pending"
             findings = expand_approved_repetitions(parsed.blocks, findings, protected_ranges)
-            findings = compile_plan(parsed.blocks, findings)
+            findings = compile_plan(parsed.blocks, findings, options)
             payload = {
                 "prefix": prefix,
                 "blocks": [b.__dict__ for b in parsed.blocks],
                 "findings": [f.json() for f in findings],
+                "replacement_options": options,
             }
             self.store.put_json(sid, "findings_blob", payload)
             self.store.update_state(sid, "review", len(findings))
@@ -360,7 +373,7 @@ class WordShieldService:
         if self.store._row(sid)['state'] == 'exported':
             return payload
         normalized = compile_plan([Block(**b) for b in payload['blocks']],
-                                  [Finding(**f) for f in payload['findings']])
+                                  [Finding(**f) for f in payload['findings']], payload.get('replacement_options'))
         if [f.json() for f in normalized] != payload['findings']:
             payload['findings'] = [f.json() for f in normalized]
             self.store.put_json(sid, 'findings_blob', payload)
@@ -374,12 +387,15 @@ class WordShieldService:
             raise ValueError("Изменять решения можно только до экспорта")
         payload = self.findings(sid)
         by_id = {f["id"]: f for f in payload["findings"]}
+        types = selected_types(payload.get('replacement_options'))
         for decision in decisions:
             finding = by_id.get(str(decision.get("id")))
             status = decision.get("status")
             if finding and status in {"accepted", "rejected", "pending"}:
                 finding["status"] = status
                 if decision.get("entity_type"):
+                    if decision['entity_type'] != finding['entity_type'] and decision['entity_type'] not in types:
+                        raise ValueError('Этот тип данных не выбран для данной сессии')
                     if decision["entity_type"] not in ENTITY_TYPES:
                         raise ValueError("Неизвестный тип сущности")
                     finding["entity_type"] = decision["entity_type"]
@@ -421,7 +437,7 @@ class WordShieldService:
             exact = block["text"][start:end]
             if exact != item.get("exact_text"):
                 raise ValueError("Ручной exact_text не совпадает")
-            if item.get("entity_type") not in ENTITY_TYPES:
+            if item.get("entity_type") not in types:
                 raise ValueError("Неизвестный тип сущности")
             duplicate = next(
                 (
@@ -485,7 +501,7 @@ class WordShieldService:
                     finding.status = previous["status"]
                     finding.entity_type = previous["entity_type"]
         resolve_clear_document_id_overlaps(updated)
-        updated = compile_plan([Block(**b) for b in payload['blocks']], updated)
+        updated = compile_plan([Block(**b) for b in payload['blocks']], updated, payload.get('replacement_options'))
         payload["findings"] = [finding.json() for finding in updated]
         self.store.put_json(sid, "findings_blob", payload)
         return payload
@@ -568,6 +584,12 @@ class WordShieldService:
                     f"[[{finding.entity_type}-{prefix}-{len(alias_by_value) + 1:03d}]]"
                 )
             finding.alias = alias_by_value[key]
+        if payload.get('replacement_options'):
+            # Reset legacy generated tokens while retaining dictionary tokens.
+            for finding in accepted:
+                if finding.alias and '-GLOB-' not in finding.alias:
+                    finding.alias = None
+            alias_by_value = short_aliases(accepted, payload['replacement_options'])
         original = self.store.raw(sid)
         blocks = [Block(**b) for b in payload["blocks"]]
         output, changed = patch_docx(original, blocks, accepted)
@@ -615,10 +637,11 @@ class WordShieldService:
         parsed = parse_docx(raw)
         tokens = ALIAS_RE.findall("\n".join(b.text for b in parsed.blocks))
         tokens.extend(
-            ALIAS_RE.fullmatch(alias).groups()
+            match.groups()
             for block in parsed.blocks
             if block.kind == "hyperlink"
             if (alias := hyperlink_alias(block.text))
+            if (match := ALIAS_RE.fullmatch(alias))
         )
         prefixes = {prefix for _, prefix, _ in tokens if prefix != "GLOB"}
         if session_id:
@@ -628,7 +651,7 @@ class WordShieldService:
         elif len(prefixes) == 1:
             row = self.store.find_by_prefix(next(iter(prefixes)))
         else:
-            raise UnsafeDocument("Выберите исходную сессию: файл содержит только постоянные алиасы или несколько сессий")
+            raise UnsafeDocument("Выберите исходную сессию: короткие и постоянные плейсхолдеры могут совпадать в разных документах. Откройте «Восстановить» из карточки нужной сессии")
         payload = self.store.get_json(row["id"], "mapping_blob")
         if not payload:
             raise UnsafeDocument("Таблица алиасов недоступна или истекла")

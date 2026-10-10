@@ -237,6 +237,10 @@ class RulesDetector:
                 segmented.append(Block(segment_id, block.part, block.kind,
                                        block.text[start:end]))
         for block in segmented:
+            for match in re.finditer(r'(?i)\b(?:СНИЛС\s*[:№]?\s*(?P<snils>\d{3}[ -]?\d{3}[ -]?\d{3}[ -]?\d{2})|SSN\s*[:№#]?\s*(?P<ssn>\d{3}-\d{2}-\d{4}))(?!\d)', block.text):
+                name = 'snils' if match.group('snils') else 'ssn'
+                a,b = match.span(name)
+                out.append(Detection(block.id,a,b,block.text[a:b],'PERSONAL_ID','rules',.99,True))
             for match in PERSON_TRIPLE_RE.finditer(block.text):
                 if any(PATRONYMIC_RE.search(word) for word in match.group().split()):
                     out.append(Detection(

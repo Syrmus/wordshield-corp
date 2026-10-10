@@ -1,0 +1,11 @@
+# WordShield Corp development boundaries
+
+This checkout is the corporate edition on branch `corp`. Read `CORP.md` before corporate implementation work.
+
+- Keep all corporate changes in this checkout and branch. Do not switch, edit, reset, commit, or deploy the user's personal checkout as part of Corp work.
+- Never run the inherited macOS deployment/update scripts against the personal Mac mini for Corp work. They are historical personal-edition tooling, not corporate deployment tools.
+- Use separate synthetic-only test data, storage directories, secrets, service names and ports. Do not read or copy personal production documents, session databases, credentials or encryption keys.
+- No production rollout, public exposure, or changes to corporate identity/network infrastructure without explicit authorization and a verified target.
+- Existing README installation instructions describe the personal edition. Corp is not yet a deployable Linux/GPU release.
+- Preserve existing local-only processing and account isolation. Do not bypass fail-closed safety checks to make Linux startup succeed.
+- Do not merge back into `main` or push a release as a normal implementation step; get explicit direction for those operations.

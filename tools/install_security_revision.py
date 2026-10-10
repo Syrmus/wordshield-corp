@@ -18,6 +18,7 @@ def main():
     parser.add_argument('--agent', type=Path, required=True)
     parser.add_argument('--source', type=Path, required=True)
     parser.add_argument('--check-only', action='store_true')
+    parser.add_argument('--enable-users', action='store_true')
     args = parser.parse_args()
     config = plistlib.loads(args.agent.read_bytes())
     env = config['EnvironmentVariables']
@@ -25,6 +26,9 @@ def main():
     data = Path(env['WORDSHIELD_DATA_DIR'])
     with sqlite3.connect(f'file:{data / "sessions.sqlite3"}?mode=ro', uri=True) as db:
         active = db.execute("SELECT count(*) FROM sessions WHERE state IN ('created','detecting')").fetchone()[0]
+    for tenant_db in (data / 'users').glob('*/sessions.sqlite3'):
+        with sqlite3.connect(f'file:{tenant_db}?mode=ro', uri=True) as db:
+            active += db.execute("SELECT count(*) FROM sessions WHERE state IN ('created','detecting')").fetchone()[0]
     if active:
         raise SystemExit('An analysis is active; retry after completion.')
     if not (args.source / 'wordshield/auth.py').is_file():
@@ -51,6 +55,8 @@ def main():
         subprocess.run(['launchctl', 'bootout', domain, str(args.agent)], check=True)
         shutil.copytree(args.source, root / 'src', dirs_exist_ok=True)
         env['WORDSHIELD_AUTH_FILE'] = str(auth_file)
+        if args.enable_users:
+            env['WORDSHIELD_USERS_ENABLED'] = '1'
         env['PYTHONDONTWRITEBYTECODE'] = '1'
         args.agent.write_bytes(plistlib.dumps(config))
         subprocess.run(['launchctl', 'bootstrap', domain, str(args.agent)], check=True)
@@ -58,7 +64,8 @@ def main():
         for _ in range(30):
             try:
                 with urllib.request.urlopen(url, timeout=2) as response:
-                    if json.load(response).get('status') == 'ok':
+                    health = json.load(response)
+                    if health.get('status') == 'ok' and (not args.enable_users or health.get('users_enabled')):
                         break
             except Exception:
                 time.sleep(1)

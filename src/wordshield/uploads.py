@@ -1,8 +1,10 @@
 """Bounded multipart parsing: sensitive uploads never roll over to disk."""
 import asyncio
+import json
 from fastapi import HTTPException, Request
 from starlette.formparsers import MultiPartException, MultiPartParser
 from starlette.datastructures import UploadFile
+from .replacement_options import validate_options
 
 
 async def read_document_upload(request: Request, max_bytes: int, *, restoring=False):
@@ -39,7 +41,8 @@ async def _read_document_upload(request: Request, max_bytes: int, *, restoring=F
     form = None
     try:
         form = await parser.parse()
-        if set(form.keys()) - {'file', 'session_id'}:
+        allowed = {'file','session_id'} if restoring else {'file','options'}
+        if set(form.keys()) - allowed or len(form.multi_items()) != len(form):
             raise HTTPException(422, 'Неизвестное поле загрузки')
         upload = form.get('file')
         if not isinstance(upload, UploadFile):
@@ -56,7 +59,16 @@ async def _read_document_upload(request: Request, max_bytes: int, *, restoring=F
         sid = form.get('session_id', '')
         if not isinstance(sid, str) or len(sid) > 64:
             raise HTTPException(422, 'Некорректная сессия')
-        return raw, filename, sid
+        if restoring:
+            return raw, filename, sid
+        value = form.get('options', '{}')
+        try:
+            if not isinstance(value,str):
+                raise ValueError('Некорректные настройки обезличивания')
+            options = validate_options(json.loads(value))
+        except (ValueError, TypeError) as exc:
+            raise HTTPException(422, str(exc)) from None
+        return raw, filename, options
     except MultiPartException as exc:
         raise HTTPException(413, 'Превышен размер или число полей загрузки') from exc
     finally:

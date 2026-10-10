@@ -30,6 +30,7 @@ from .accounts import Accounts
 from .tenants import TenantServices
 from .account_ui import install_account_routes
 from .replacement_options import CATEGORIES, LABELS, selected_types
+from .corp_runtime import validate_corp
 
 
 class DecisionPatch(BaseModel):
@@ -39,7 +40,18 @@ class DecisionPatch(BaseModel):
 
 def create_app(settings: Settings | None = None) -> FastAPI:
     cfg = settings or Settings.from_env()
+    corporate = os.getenv('WORDSHIELD_EDITION') == 'corp'
+    if corporate:
+        validate_corp(cfg)
     page = APP_PAGE
+    def corp_copy(value):
+        if not corporate:
+            return value
+        return (value.replace('на офисном Mac mini', 'на корпоративном сервере')
+                .replace('Офисный Mac mini · Tailscale', 'WordShield Corp · Внутренний сервер')
+                .replace('Для доступа включите Tailscale. Mac mini должен быть включён и доступен.',
+                         'Доступ предоставляется компанией. При проблемах со входом обратитесь к ИТ.'))
+    page = corp_copy(page)
     if setup_label := os.getenv("WORDSHIELD_SETUP_LABEL"):
         banner = (
             "<details class='setup'><summary>Модели обработки</summary>"
@@ -54,11 +66,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     if users_enabled and not browser_auth.data:
         raise RuntimeError('User accounts require a provisioned WORDSHIELD_AUTH_FILE')
     accounts = Accounts(cfg.data_dir, browser_auth.data) if users_enabled else None
+    oidc = None
+    if os.getenv('WORDSHIELD_OIDC_ISSUER'):
+        if not accounts or not corporate:
+            raise RuntimeError('OIDC requires Corp accounts')
+        from .oidc import CorporateOIDC
+        oidc = CorporateOIDC(accounts)
     tenants = TenantServices(base_service, accounts)
     service = tenants if accounts else base_service
     if accounts:
         page = page.replace('</nav>', "<a class='nav-link' href='/account'>👤 Личный кабинет</a></nav>")
     jobs: dict[str, asyncio.Task] = {}
+    job_owners = {}
     analysis_slot = asyncio.Semaphore(1)
     upload_slot = asyncio.Lock()
 
@@ -67,8 +86,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             await owner_service.analyze_session(sid, preserve_decisions=preserve_decisions)
 
     def check_capacity():
-        if len(jobs) >= 4:
-            raise HTTPException(429, 'В очереди уже четыре файла. Дождитесь завершения анализа.',
+        if corporate and sum(owner == str(service.store.root) for owner in job_owners.values()) >= 2:
+            raise HTTPException(429, 'У вас уже два файла в обработке. Дождитесь завершения.', headers={'Retry-After':'30'})
+        if len(jobs) >= (20 if corporate else 4):
+            raise HTTPException(429, 'Очередь заполнена. Дождитесь завершения анализа.',
                                 headers={'Retry-After': '30'})
 
     def launch(sid: str, preserve_decisions=False) -> None:
@@ -80,9 +101,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         owner_service = tenants.selected.get() if accounts else base_service
         task = asyncio.create_task(run_analysis(owner_service, sid, preserve_decisions))
         jobs[sid] = task
+        job_owners[sid] = str(owner_service.settings.data_dir)
 
         def finished(done: asyncio.Task) -> None:
             jobs.pop(sid, None)
+            job_owners.pop(sid, None)
             if not done.cancelled():
                 with suppress(Exception):
                     done.result()
@@ -91,6 +114,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
+        process_lock = None
+        if corporate:
+            import fcntl
+            process_lock = (cfg.data_dir / '.corp-process.lock').open('a')
+            try:
+                fcntl.flock(process_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                process_lock.close()
+                raise RuntimeError('Corp pilot supports only one app process per data directory') from None
         if cfg.render_required:
             from .ram_workspace import cleanup_stale_workspaces
             await asyncio.to_thread(cleanup_stale_workspaces)
@@ -123,9 +155,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 await asyncio.gather(*jobs.values(), return_exceptions=True)
             await base_service.gliner.close()
             await base_service.privacy.close()
+            if process_lock:
+                process_lock.close()
 
     app = FastAPI(
-        title="WordShield Local", docs_url=None, redoc_url=None, lifespan=lifespan
+        title="WordShield Corp" if corporate else "WordShield Local", docs_url=None, redoc_url=None, lifespan=lifespan
     )
     app.state.service = base_service
     app.state.accounts = accounts
@@ -142,6 +176,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def identity_gate(request: Request, call_next):
         if request.url.path == "/healthz":
             return await call_next(request)
+        if corporate:
+            from urllib.parse import urlsplit
+            expected = urlsplit(os.environ['WORDSHIELD_PUBLIC_URL'])
+            if request.url.scheme != 'https' or request.url.netloc.lower() != expected.netloc.lower():
+                return Response('Unexpected public origin', 400)
         if cfg.trust_tailscale_headers:
             login = request.headers.get("Tailscale-User-Login", "")
             if login.casefold() != cfg.allowed_user.casefold():
@@ -157,6 +196,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         user = accounts.current(request.cookies.get(COOKIE,'')) if accounts else None
         authenticated = bool(user) if accounts else browser_auth.valid(request.cookies.get(COOKIE,''))
         public = {'/login', '/register', '/favicon.svg'} if accounts else {'/login'}
+        if oidc:
+            public |= {'/auth/login', '/auth/callback'}
         if request.url.path not in public and not authenticated:
             return Response('Требуется вход', 401) if request.url.path.startswith('/api/') else RedirectResponse('/login', 303)
         request.state.user = user
@@ -176,7 +217,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return response
 
     if accounts:
-        install_account_routes(app, accounts, page)
+        install_account_routes(app, accounts, page, oidc)
+    if oidc:
+        oidc.install(app)
 
     def login_page():
         return page.replace('{{CONTENT}}', "<h1>Вход в WordShield</h1><p>Введите пароль доступа. На этом браузере вход сохранится на 30 дней.</p><form method='post' action='/login'><label>Пароль <input type='password' name='password' maxlength='256' autocomplete='current-password' required></label><button>Войти</button></form>")
@@ -224,7 +267,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "detectors": ["rules"] + (["gliner-ru"] if cfg.gliner_required else [])
                     + (["privacy-filter"] if cfg.privacy_required else [])
                     + (["qwen"] if cfg.qwen_required else []), "cloud_fallback": False,
-                "users_enabled": bool(accounts)}
+                "users_enabled": bool(accounts), "edition": 'corp' if corporate else 'personal',
+                "authentication": 'oidc' if oidc else 'local', "readiness": 'not_checked'}
+
+    @app.get('/admin/system', response_class=HTMLResponse)
+    def corporate_system(request: Request):
+        if not corporate or not accounts or request.state.user['role'] != 'admin':
+            raise HTTPException(403)
+        device = html.escape(cfg.privacy_device)
+        authentication = 'Корпоративный OIDC' if oidc else 'Локальные аккаунты для пилота'
+        return page.replace('{{CONTENT}}', '<h1>WordShield Corp — состояние</h1>'
+            + f'<p>Вход: {authentication}. Заданий в очереди и обработке: {len(jobs)} из 20.</p>'
+            + f'<p>Обработчик: этот сервер. GLiNER RU + Privacy Filter RU, устройство: {device}.</p>'
+            + '<p>Один анализ одновременно. Общий срок хранения файлов и алиасов — 90 дней от загрузки.</p>'
+            + '<p>Эта страница не подтверждает готовность моделей. ИТ запускают встроенную синтетическую проверку перед вводом в работу.</p>'
+            + '<p>Настройки сервера, моделей и входа меняются ИТ в конфигурации установки. Секреты здесь не отображаются.</p>')
 
     @app.get("/", response_class=HTMLResponse)
     def home():
@@ -237,7 +294,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             + upload_widget("/upload", "Найти чувствительные данные", cfg.max_upload_bytes)
             + FEATURES
             + session_table(5)
-            + "<details><summary>Форматы и ограничения</summary><p>DOC и DOCX обрабатываются на офисном Mac mini. "
+            + "<details><summary>Форматы и ограничения</summary><p>DOC и DOCX обрабатываются на сервере WordShield. "
             "DOC автоматически преобразуется в DOCX; оформление при конвертации может немного измениться. "
             "Изображения удаляются из обезличенной копии. Вложения, макросы и другие неподдерживаемые объекты блокируют экспорт.</p></details>"
             + "<details><summary>Что решается автоматически</summary>"
@@ -516,7 +573,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         "нажмите «Зарегистрироваться» на странице входа и попросите администратора одобрить заявку. "
                         "Администратор также может создать аккаунт и передать вам данные входа. "
                         "При потере пароля обратитесь к нему.</p></section>") if accounts else ''
-        return page.replace("{{CONTENT}}", HELP_CONTENT + account_help)
+        return page.replace("{{CONTENT}}", corp_copy(HELP_CONTENT) + account_help)
 
     @app.get("/restore", response_class=HTMLResponse)
     def restore_page(session_id: str = ""):

@@ -4,10 +4,12 @@ import os
 import struct
 import subprocess
 import threading
+import sys
 from pathlib import Path
 
 from .ooxml import UnsafeDocument, parse_docx
 from .ram_workspace import ram_workspace
+from .linux_sandbox import sandbox_command
 
 _converter = threading.Lock()
 _CFB = bytes.fromhex("d0cf11e0a1b11ae1")
@@ -49,7 +51,7 @@ def convert_doc(raw: bytes, settings) -> bytes:
         raise UnsafeDocument("Файл превышает допустимый размер")
     validate_legacy_doc(raw)
     # The deployed service inherits its OS network-denial sandbox.
-    if os.getenv("WORDSHIELD_INHERIT_NETWORK_SANDBOX") != "1":
+    if sys.platform != 'linux' and os.getenv("WORDSHIELD_INHERIT_NETWORK_SANDBOX") != "1":
         raise UnsafeDocument("Конвертация DOC требует изолированного локального режима")
     if not _converter.acquire(timeout=30):
         raise UnsafeDocument("Конвертер занят. Повторите загрузку через минуту")
@@ -71,11 +73,11 @@ def convert_doc(raw: bytes, settings) -> bytes:
             output = root / "out"
             output.mkdir()
             try:
-                proc = subprocess.run([
+                proc = subprocess.run(sandbox_command([
                     settings.libreoffice_path, "-env:UserInstallation=" + profile.as_uri(),
                     "--headless", "--nologo", "--nodefault", "--nolockcheck", "--norestore",
                     "--convert-to", "docx:Office Open XML Text", "--outdir", str(output), str(source),
-                ], capture_output=True, timeout=60,
+                ]), capture_output=True, timeout=60,
                     env={"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "HOME": temporary, "TMPDIR": temporary})
             except (subprocess.TimeoutExpired, OSError) as exc:
                 raise UnsafeDocument("Не удалось конвертировать DOC локально за 60 секунд") from exc

@@ -91,6 +91,9 @@ def main():
     except PermissionError:
         pass
     mode = sys.argv[2] if len(sys.argv) > 2 else "gliner"
+    device = sys.argv[3] if len(sys.argv) > 3 else 'cpu'
+    if device not in {'cpu', 'cuda', 'cuda:0'}:
+        raise ValueError('unapproved device')
     if mode == "privacy":
         checkpoint = verify_privacy_checkpoint(sys.argv[1])
         # tiktoken ignores HF offline flags and otherwise uses a temporary
@@ -102,7 +105,7 @@ def main():
         from wordshield.models import Block
         from contextlib import redirect_stdout
         with redirect_stdout(sys.stderr):
-            detector = PrivacyFilterDetector(SimpleNamespace(privacy_checkpoint=str(checkpoint), privacy_device="cpu"))
+            detector = PrivacyFilterDetector(SimpleNamespace(privacy_checkpoint=str(checkpoint), privacy_device=device))
             detector._load()
             detector._opf.get_runtime()
         print(json.dumps({"ready": True, "network_denied": True}), flush=True)
@@ -130,7 +133,7 @@ def main():
         # AutoExtractor dispatches only to packaged architectures and rejects
         # trust_remote_code entirely; its loader has no remote-code path.
         model = AutoExtractor.from_pretrained(str(root), local_files_only=True)
-        model.to("cpu")
+        model.to(device)
         model.eval()
     print(json.dumps({"ready": True, "network_denied": True}), flush=True)
     for line in sys.stdin:

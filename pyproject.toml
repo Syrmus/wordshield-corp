@@ -20,6 +20,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8,<10", "python-docx>=1.1,<2"]
+corp = ["PyJWT[crypto]>=2.10,<3"]
 
 [project.scripts]
 wordshield = "wordshield.main:main"

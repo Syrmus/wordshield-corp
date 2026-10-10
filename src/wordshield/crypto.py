@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import os
 import subprocess
+import stat
 from pathlib import Path
 
 from nacl.secret import Aead
@@ -17,6 +18,18 @@ class KeyProvider:
 
     def master_key(self) -> bytes:
         encoded = os.getenv("WORDSHIELD_MASTER_KEY")
+        if secret := os.getenv('WORDSHIELD_MASTER_KEY_FILE'):
+            if encoded or os.getenv('WORDSHIELD_DEV_KEY_FILE'):
+                raise RuntimeError('Conflicting master key sources')
+            path = Path(secret)
+            if not path.is_absolute() or path.is_symlink():
+                raise RuntimeError('Master key must be an absolute non-symlink secret file')
+            info = path.stat()
+            if not stat.S_ISREG(info.st_mode) or info.st_mode & 0o077:
+                raise RuntimeError('Master key file must have mode 0600 or 0400')
+            if info.st_size > 128:
+                raise RuntimeError('Invalid master key file')
+            encoded = path.read_text().strip()
         if encoded:
             key = base64.urlsafe_b64decode(encoded)
         elif os.getenv("WORDSHIELD_DEV_KEY_FILE"):

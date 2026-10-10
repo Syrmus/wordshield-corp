@@ -1,0 +1,119 @@
+name: wordshield-corp
+services:
+  app:
+    image: wordshield-corp:pilot
+    build:
+      context: ../..
+      dockerfile: deploy/corp/Dockerfile
+      target: runtime
+    user: "${APP_UID:-10001}:${APP_GID:-10001}"
+    init: true
+    restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 256
+    mem_limit: 16g
+    cpus: 8
+    environment:
+      WORDSHIELD_EDITION: corp
+      WORDSHIELD_PUBLIC_URL: ${WORDSHIELD_PUBLIC_URL:?Set the internal HTTPS URL}
+      WORDSHIELD_DATA_DIR: /data
+      WORDSHIELD_MASTER_KEY_FILE: /run/secrets/master.key
+      WORDSHIELD_AUTH_FILE: /run/secrets/bootstrap.json
+      WORDSHIELD_USERS_ENABLED: "1"
+      WORDSHIELD_REGISTRATION_ENABLED: "0"
+      WORDSHIELD_TRUST_TAILSCALE_HEADERS: "0"
+      WORDSHIELD_GLINER_REQUIRED: "1"
+      WORDSHIELD_PRIVACY_REQUIRED: "1"
+      WORDSHIELD_RENDER_REQUIRED: "1"
+      WORDSHIELD_QWEN_REQUIRED: "0"
+      WORDSHIELD_GLINER_CHECKPOINT: /models/gliner
+      WORDSHIELD_PRIVACY_CHECKPOINT: /models/privacy
+      WORDSHIELD_GLINER_DEVICE: ${WORDSHIELD_DEVICE:-cpu}
+      WORDSHIELD_PRIVACY_DEVICE: ${WORDSHIELD_DEVICE:-cpu}
+      WORDSHIELD_LIBREOFFICE: /usr/bin/soffice
+      WORDSHIELD_TMP_DIR: /run/wordshield-tmp
+      WORDSHIELD_SETUP_LABEL: "Corp pilot · GLiNER RU + Privacy Filter RU + правила"
+      WORDSHIELD_OIDC_ISSUER: ${WORDSHIELD_OIDC_ISSUER:-}
+      WORDSHIELD_OIDC_CLIENT_ID: ${WORDSHIELD_OIDC_CLIENT_ID:-}
+      WORDSHIELD_OIDC_CLIENT_SECRET_FILE: /run/secrets/oidc-client.secret
+      WORDSHIELD_OIDC_USER_GROUP: ${WORDSHIELD_OIDC_USER_GROUP:-WordShield Users}
+      WORDSHIELD_OIDC_ADMIN_GROUP: ${WORDSHIELD_OIDC_ADMIN_GROUP:-WordShield Admins}
+      WORDSHIELD_OIDC_GROUP_CLAIM: ${WORDSHIELD_OIDC_GROUP_CLAIM:-groups}
+      FORWARDED_ALLOW_IPS: ${PROXY_IP:-172.30.74.10}
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+      HF_HUB_DISABLE_TELEMETRY: "1"
+      DO_NOT_TRACK: "1"
+      OTEL_SDK_DISABLED: "true"
+    volumes:
+      - ../../.corp-runtime/data:/data
+      - ../../.corp-runtime/secrets/master.key:/run/secrets/master.key:ro
+      - ../../.corp-runtime/secrets/bootstrap.json:/run/secrets/bootstrap.json:ro
+      - ../../.corp-runtime/secrets/oidc-client.secret:/run/secrets/oidc-client.secret:ro
+      - ../../.corp-runtime/models:/models:ro
+    tmpfs:
+      - /tmp:size=512m,mode=1777,nosuid,nodev
+      - /run/wordshield-tmp:size=512m,mode=0700,uid=${APP_UID:-10001},gid=${APP_GID:-10001},nosuid,nodev,noexec
+    networks: [private]
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8844/healthz',timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    logging:
+      driver: local
+      options: {max-size: 5m, max-file: "2"}
+
+  proxy:
+    image: nginx:1.28-alpine
+    user: "${APP_UID:-10001}:${APP_GID:-10001}"
+    command: [nginx, -g, "daemon off;"]
+    restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 64
+    mem_limit: 256m
+    ports: ["127.0.0.1:${HTTPS_PORT:-8443}:8443"]
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ../../.corp-runtime/tls:/tls:ro
+    tmpfs: [/tmp:size=64m,mode=1777,nosuid,nodev]
+    networks:
+      ingress: {}
+      private:
+        ipv4_address: ${PROXY_IP:-172.30.74.10}
+    depends_on:
+      app: {condition: service_healthy}
+    logging:
+      driver: local
+      options: {max-size: 5m, max-file: "2"}
+
+  init:
+    profiles: [setup]
+    image: wordshield-corp:pilot
+    user: "${APP_UID:-10001}:${APP_GID:-10001}"
+    network_mode: none
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    volumes: [../../.corp-runtime:/bootstrap]
+    command: [python, -m, wordshield.corp_init, /bootstrap]
+
+  provision:
+    profiles: [provision]
+    image: wordshield-corp:pilot
+    user: "${APP_UID:-10001}:${APP_GID:-10001}"
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    volumes: [../../.corp-runtime/models:/models]
+    command: [python, -m, wordshield.corp_init, --models, /models]
+    networks: [ingress]
+
+networks:
+  private:
+    internal: true
+    ipam:
+      config: [{subnet: "${PRIVATE_SUBNET:-172.30.74.0/24}"}]
+  ingress: {}

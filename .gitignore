@@ -25,3 +25,10 @@ ui-preview/
 *.jpeg
 *.tiff
 *.heic
+.corp-runtime/
+*.crt
+*.p12
+*.pfx
+secrets/
+build/
+dist/

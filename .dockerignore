@@ -1,0 +1,15 @@
+**
+!pyproject.toml
+!src/
+!src/wordshield/
+!src/wordshield/*.py
+!deploy/
+!deploy/corp/
+!deploy/corp/requirements*.txt
+!tools/
+!tools/install_gliner_weights.py
+!tools/install_privacy_ru.py
+!tools/provision_privacy_tokenizer.py
+!tools/*.py
+!tests/
+!tests/**

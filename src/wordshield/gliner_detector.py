@@ -34,18 +34,21 @@ class GlinerDetector:
         self.lock = asyncio.Lock()
 
     async def _start(self):
-        if sys.platform != "darwin" or not Path("/usr/bin/sandbox-exec").exists():
+        if sys.platform not in {"linux", "darwin"} or (sys.platform == "darwin" and not Path("/usr/bin/sandbox-exec").exists()):
             raise DetectorUnavailable("Локальный детектор требует системную изоляцию сети macOS")
         worker = str(Path(__file__).with_name("local_worker.py"))
         # macOS refuses applying a different nested sandbox. An inherited
         # application policy is acceptable only with the worker's active OS
         # denial probe, which runs before it receives document text.
-        sandbox = [] if os.getenv("WORDSHIELD_INHERIT_NETWORK_SANDBOX") == "1" else [
+        sandbox = [] if sys.platform == 'linux' or os.getenv("WORDSHIELD_INHERIT_NETWORK_SANDBOX") == "1" else [
             "/usr/bin/sandbox-exec", "-p", "(version 1)(allow default)(deny network*)"]
+        if sys.platform == 'linux':
+            sandbox = [sys.executable, str(Path(__file__).with_name('linux_sandbox.py'))]
         self.process = await asyncio.create_subprocess_exec(
             *sandbox,
             (self.settings.gliner_python if self.mode == "gliner" else self.settings.privacy_python) or sys.executable,
             worker, self.settings.gliner_checkpoint if self.mode == "gliner" else self.settings.privacy_checkpoint, self.mode,
+            os.getenv('WORDSHIELD_GLINER_DEVICE', 'cpu') if self.mode == 'gliner' else self.settings.privacy_device,
             stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
             env={**os.environ, "HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1", "HF_HUB_DISABLE_TELEMETRY": "1"},
             limit=16*1024*1024,

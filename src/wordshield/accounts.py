@@ -36,6 +36,9 @@ class Accounts:
                     digest TEXT PRIMARY KEY, user_id TEXT NOT NULL, expires REAL NOT NULL);
                 CREATE TABLE IF NOT EXISTS attempts (bucket TEXT NOT NULL, created REAL NOT NULL);
                 CREATE INDEX IF NOT EXISTS attempt_bucket ON attempts(bucket, created);
+                CREATE TABLE IF NOT EXISTS external_identities (
+                    issuer TEXT NOT NULL, subject TEXT NOT NULL, user_id TEXT UNIQUE NOT NULL,
+                    display_name TEXT NOT NULL, PRIMARY KEY(issuer,subject));
             ''')
             # Additive, transactional and idempotent. Existing document files never move.
             if not db.execute('SELECT 1 FROM users WHERE legacy_owner=1').fetchone():
@@ -57,7 +60,48 @@ class Accounts:
 
     def list(self):
         with self.connect() as db:
-            return [dict(r) for r in db.execute('SELECT id,username,role,status,created,legacy_owner FROM users ORDER BY created')]
+            return [dict(r) for r in db.execute('''SELECT u.id,u.username,u.role,u.status,u.created,u.legacy_owner,
+                COALESCE(e.display_name,u.username) AS display_name FROM users u
+                LEFT JOIN external_identities e ON e.user_id=u.id ORDER BY u.created''')]
+
+    def is_external(self, uid):
+        with self.connect() as db:
+            return bool(db.execute('SELECT 1 FROM external_identities WHERE user_id=?', (uid,)).fetchone())
+
+    def external_login(self, issuer, subject, display_name, role, expires):
+        if not isinstance(subject, str) or not subject or len(subject) > 512 or expires <= time.time():
+            raise ValueError('Invalid external identity')
+        denied = False
+        token = secrets.token_urlsafe(32)
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            row = db.execute('''SELECT u.* FROM users u JOIN external_identities e ON e.user_id=u.id
+                                WHERE e.issuer=? AND e.subject=?''', (issuer, subject)).fetchone()
+            if role not in {'user', 'admin'}:
+                if row:
+                    db.execute('DELETE FROM logins WHERE user_id=?', (row['id'],))
+                denied = True
+            elif row and row['status'] != 'active':
+                denied = True
+            else:
+                uid = row['id'] if row else secrets.token_hex(16)
+                if not row:
+                    if db.execute('SELECT count(*) FROM users').fetchone()[0] >= 1000:
+                        raise ValueError('Account limit reached')
+                    db.execute('INSERT INTO users VALUES (?,?,?,?,?,?,?,?)',
+                               (uid, 'sso-'+uid, '', '', role, 'active', time.time(), 0))
+                    db.execute('INSERT INTO external_identities VALUES (?,?,?,?)',
+                               (issuer, subject, uid, display_name))
+                else:
+                    db.execute('UPDATE users SET role=? WHERE id=?', (role, uid))
+                    db.execute('UPDATE external_identities SET display_name=? WHERE user_id=?', (display_name, uid))
+                # Every external login replaces older sessions (and outdated roles).
+                db.execute('DELETE FROM logins WHERE user_id=? OR expires<=?', (uid, time.time()))
+                db.execute('INSERT INTO logins VALUES (?,?,?)',
+                           (hashlib.sha256(token.encode()).hexdigest(), uid, expires))
+        if denied:
+            raise ValueError('Corporate access denied')
+        return token
 
     def allow(self, bucket, limit, window=300):
         now = time.time()
@@ -99,7 +143,10 @@ class Accounts:
         if len(password) > 256:
             return None
         # Unknown users do the same expensive hash; errors never disclose account state.
-        digest = password_hash(password, user['salt'] if user else '00'*16)
+        external = bool(user and self.is_external(user['id']))
+        digest = password_hash(password, user['salt'] if user and not external else '00'*16)
+        if external:
+            return None
         if not user or not hmac.compare_digest(digest, user['password_hash']) or user['status'] != 'active':
             return None
         token = secrets.token_urlsafe(32)
@@ -118,8 +165,10 @@ class Accounts:
         if not token or len(token) > 128:
             return None
         with self.connect() as db:
-            row = db.execute('''SELECT u.id,u.username,u.role,u.status,u.legacy_owner FROM users u
-                JOIN logins l ON l.user_id=u.id WHERE l.digest=? AND l.expires>? AND u.status='active' ''',
+            row = db.execute('''SELECT u.id,u.username,u.role,u.status,u.legacy_owner,
+                COALESCE(e.display_name,u.username) AS display_name FROM users u
+                JOIN logins l ON l.user_id=u.id LEFT JOIN external_identities e ON e.user_id=u.id
+                WHERE l.digest=? AND l.expires>? AND u.status='active' ''',
                 (hashlib.sha256(token.encode()).hexdigest(), time.time())).fetchone()
         return dict(row) if row else None
 
@@ -144,6 +193,8 @@ class Accounts:
                     "SELECT count(*) FROM users WHERE role='admin' AND status='active'").fetchone()[0] <= 1:
                     raise ValueError('Нельзя заблокировать последнего администратора')
             if action == 'reset':
+                if db.execute('SELECT 1 FROM external_identities WHERE user_id=?', (uid,)).fetchone():
+                    raise ValueError('Пароль корпоративного аккаунта управляется в компании')
                 salt = secrets.token_hex(16)
                 db.execute('UPDATE users SET salt=?,password_hash=? WHERE id=?', (salt,password_hash(password,salt),uid))
             else:
@@ -155,6 +206,8 @@ class Accounts:
             db.execute('DELETE FROM logins WHERE user_id=?', (uid,))
 
     def change_password(self, uid, old, new):
+        if self.is_external(uid):
+            raise ValueError('Пароль корпоративного аккаунта управляется в компании')
         validate_password(new)
         if len(old) > 256 or not self.allow('password:'+uid, 8):
             raise ValueError('Слишком много попыток. Повторите через пять минут')

@@ -1,5 +1,6 @@
 """Account UI; deliberately has no access to document stores."""
 import html
+import os
 from urllib.parse import parse_qs
 
 from fastapi import HTTPException, Request
@@ -22,7 +23,8 @@ def fields(register=False):
             + f"<label>Пароль<input type='password' name='password' minlength='12' maxlength='256' autocomplete='{'new-password' if register else 'current-password'}' required></label>")
 
 
-def install_account_routes(app, accounts, page):
+def install_account_routes(app, accounts, page, oidc=None):
+    registration = os.getenv('WORDSHIELD_REGISTRATION_ENABLED', '1') == '1' and not oidc
     def render(content, status=200):
         return HTMLResponse(page.replace('{{CONTENT}}', content), status)
 
@@ -35,12 +37,18 @@ def install_account_routes(app, accounts, page):
 
     @app.get('/login')
     def login_page():
+        if oidc:
+            return render("<h1>WordShield Corp</h1><p><a class='button' href='/auth/login'>Войти через компанию</a></p>"
+                          + "<details><summary>Аварийный вход администратора</summary><form method='post' action='/login'>"
+                          + fields() + "<button>Войти</button></form></details>")
         return render("<h1>Вход в WordShield</h1><p>Введите логин и пароль своего кабинета.</p><form method='post' action='/login'>"
-                      + fields() + "<button>Войти</button></form><p><a href='/register'>Зарегистрироваться</a> · Если забыли пароль, обратитесь к администратору.</p>")
+                      + fields() + "<button>Войти</button></form><p>" + ("<a href='/register'>Зарегистрироваться</a> · " if registration else '') + "Если забыли пароль, обратитесь к администратору.</p>")
 
     @app.post('/login')
     async def login(request: Request):
         data = await small_form(request)
+        if oidc and data.get('username', '').strip().casefold() != 'admin':
+            return render('Используйте корпоративный вход', 403)
         token = accounts.authenticate(data.get('username',''), data.get('password',''), request.client.host if request.client else 'local')
         if not token:
             return render("<h1>Войти не удалось</h1><p>Проверьте логин и пароль. Новую регистрацию должен одобрить администратор. После нескольких попыток подождите пять минут.</p><a href='/login'>Повторить</a>",403)
@@ -50,11 +58,15 @@ def install_account_routes(app, accounts, page):
 
     @app.get('/register')
     def register_page():
+        if not registration:
+            raise HTTPException(404)
         return render("<h1>Регистрация</h1><p>Придумайте логин (латиницей) и пароль от 12 символов. Доступ появится только после одобрения администратором. Письма не отправляются.</p>"
                       + "<form method='post' action='/register'>"+fields(True)+"<button>Отправить заявку</button></form><a href='/login'>Уже есть аккаунт</a>")
 
     @app.post('/register')
     async def register(request: Request):
+        if not registration:
+            raise HTTPException(404)
         data = await small_form(request)
         if not accounts.allow('register',10):
             raise HTTPException(429,'Слишком много заявок. Повторите через пять минут')
@@ -74,6 +86,11 @@ def install_account_routes(app, accounts, page):
     @app.get('/account')
     def account(request: Request):
         user = request.state.user
+        if accounts.is_external(user['id']):
+            return render('<h1>Личный кабинет</h1><p>'+html.escape(user['display_name'])+'</p>'
+                          + ("<p><a href='/admin/users'>Управление пользователями</a></p>" if user['role']=='admin' else '')
+                          + "<p>Вход и пароль управляются компанией. Выход здесь завершает только сеанс WordShield.</p>"
+                          + "<form method='post' action='/logout'><button>Выйти</button></form>")
         return render('<h1>Личный кабинет</h1><p>Вы вошли как <strong>'+html.escape(user['username'])+'</strong>.</p>'
                       + ("<p><a href='/admin/users'>Управление пользователями →</a></p>" if user['role']=='admin' else '')
                       + "<p>Ваши документы, сессии и постоянные замены не видны другим пользователям. Срок хранения файлов — 90 дней от загрузки.</p>"
@@ -97,9 +114,11 @@ def install_account_routes(app, accounts, page):
             uid = user['id']
             action,label = ('approve','Одобрить') if user['status']=='pending' else ('unblock','Разблокировать') if user['status']=='blocked' else ('block','Заблокировать')
             controls = '' if uid==request.state.user['id'] else f"<form method='post' action='/admin/users/{uid}/{action}'><button>{label}</button></form>"
-            controls += f"<details><summary>Задать новый пароль</summary><form method='post' action='/admin/users/{uid}/reset'><input type='password' name='password' minlength='12' maxlength='256' autocomplete='new-password' required aria-label='Новый пароль'><button>Сбросить пароль</button></form></details>"
-            rows.append(f"<tr><td>{html.escape(user['username'])}</td><td>{'Администратор' if user['role']=='admin' else 'Пользователь'}</td><td>{statuses[user['status']]}</td><td>{controls}</td></tr>")
-        return render("<h1>Пользователи</h1><p>Здесь можно одобрить заявку, создать аккаунт, заблокировать доступ или сбросить пароль. Чужие документы здесь не отображаются. Блокировка завершает вход на всех устройствах; файлы сохраняются до конца их срока хранения.</p>"
+            if not accounts.is_external(uid):
+                controls += f"<details><summary>Задать новый пароль</summary><form method='post' action='/admin/users/{uid}/reset'><input type='password' name='password' minlength='12' maxlength='256' autocomplete='new-password' required aria-label='Новый пароль'><button>Сбросить пароль</button></form></details>"
+            rows.append(f"<tr><td>{html.escape(user['display_name'])}</td><td>{'Администратор' if user['role']=='admin' else 'Пользователь'}</td><td>{statuses[user['status']]}</td><td>{controls}</td></tr>")
+        return render("<h1>Пользователи</h1>" + ("<p><a href='/admin/system'>Состояние Corp →</a></p>" if os.getenv('WORDSHIELD_EDITION') == 'corp' else '')
+                      + "<p>Здесь можно одобрить заявку, создать аккаунт, заблокировать доступ или сбросить пароль. Чужие документы здесь не отображаются. Блокировка завершает вход на всех устройствах; файлы сохраняются до конца их срока хранения.</p>"
                       + "<table><thead><tr><th>Логин</th><th>Роль</th><th>Статус</th><th>Действия</th></tr></thead><tbody>"+''.join(rows)+"</tbody></table>"
                       + "<h2>Создать аккаунт</h2><form method='post' action='/admin/users'>"+fields(True)+"<label>Роль<select name='role'><option value='user'>Пользователь</option><option value='admin'>Администратор</option></select></label><button>Создать</button></form><p>Передайте логин и пароль лично. Получатель может сменить пароль в своём кабинете.</p>")
 

@@ -5,6 +5,7 @@ import io
 import json
 import hashlib
 import logging
+import os
 import re
 import subprocess
 import sys
@@ -52,6 +53,7 @@ from .image_removal import remove_images
 from .replacement_plan import compile_plan
 from .replacement_options import validate_options, selected_types, selected_findings, short_aliases
 from .ram_workspace import ram_workspace
+from .linux_sandbox import sandbox_command
 
 ALIAS_RE = re.compile(r"\[\[([A-Z_]+)-([A-Z2-7]{4})-(\d{3,})(?::[^\[\]\r\n]{1,80})?\]\]")
 ENTITY_TYPES = {
@@ -139,6 +141,7 @@ class WordShieldService:
                 "raw": hashlib.sha256(raw).hexdigest(), "model": self.settings.lm_model,
                 "privacy": self.settings.privacy_checkpoint, "gliner": self.settings.gliner_checkpoint,
                 "threshold": self.settings.gliner_threshold,
+                "devices": [self.settings.privacy_device, os.getenv('WORDSHIELD_GLINER_DEVICE', 'cpu')],
                 "privacy_weights": model_identity(self.settings.privacy_checkpoint) if self.settings.privacy_required else None,
                 "privacy_tokenizer": model_identity(Path(self.settings.privacy_checkpoint).parent / "tokenizer-cache") if self.settings.privacy_required else None,
                 "privacy_runtime": runtime_identity(self.settings.privacy_python or sys.executable) if self.settings.privacy_required else None,
@@ -517,7 +520,7 @@ class WordShieldService:
             env = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "HOME": tmp, "TMPDIR": tmp}
             try:
                 proc = subprocess.run(
-                    [
+                    sandbox_command([
                     self.settings.libreoffice_path,
                     "-env:UserInstallation=" + (Path(tmp) / "lo-profile").as_uri(),
                     "--headless",
@@ -529,7 +532,7 @@ class WordShieldService:
                     "--outdir",
                     str(out),
                     str(source),
-                    ],
+                    ]),
                     check=False,
                     capture_output=True,
                     text=True,

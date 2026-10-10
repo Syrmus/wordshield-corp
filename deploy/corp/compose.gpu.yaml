@@ -1,0 +1,12 @@
+services:
+  app:
+    environment:
+      WORDSHIELD_GLINER_DEVICE: cuda:0
+      WORDSHIELD_PRIVACY_DEVICE: cuda:0
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${GPU_ID:-0}"]
+              capabilities: [gpu]

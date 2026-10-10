@@ -9,6 +9,7 @@ import uuid
 import threading
 import json
 import os
+import sys
 
 from .ooxml import UnsafeDocument
 
@@ -16,8 +17,23 @@ from .ooxml import UnsafeDocument
 _workspace_lock = threading.Lock()
 
 
+def linux_tmpfs_root():
+    root = Path(os.getenv('WORDSHIELD_TMP_DIR', '/run/wordshield-tmp')).resolve(strict=True)
+    mounts = [line.split() for line in Path('/proc/mounts').read_text().splitlines()]
+    if not any(row[1] == str(root) and row[2] == 'tmpfs' for row in mounts):
+        raise UnsafeDocument('Временный каталог должен быть отдельным tmpfs')
+    if root.stat().st_mode & 0o077 or root.stat().st_uid != os.getuid():
+        raise UnsafeDocument('Небезопасные права временного каталога')
+    if len(Path('/proc/swaps').read_text().splitlines()) > 1:
+        raise UnsafeDocument('Для обработки без записи временных данных на диск отключите swap на сервере')
+    return root
+
+
 def cleanup_stale_workspaces():
     """Detach only our verified RAM volumes whose owning process no longer exists."""
+    if sys.platform == 'linux':
+        linux_tmpfs_root()  # container lifecycle destroys the dedicated mount
+        return 0
     info = subprocess.run(['/usr/bin/hdiutil', 'info', '-plist'], capture_output=True,
                           check=True, timeout=20)
     removed = 0
@@ -67,6 +83,10 @@ def ram_workspace():
 
 @contextmanager
 def _ram_workspace():
+    if sys.platform == 'linux':
+        with tempfile.TemporaryDirectory(prefix='convert-', dir=linux_tmpfs_root()) as temporary:
+            yield temporary
+        return
     device = None
     try:
         attached = subprocess.run(['/usr/bin/hdiutil', 'attach', '-nomount', 'ram://524288'],

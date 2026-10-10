@@ -38,6 +38,7 @@ def test_rejects_renamed_rtf_zip_and_corrupt_ole():
 
 
 def test_converter_rejects_missing_isolation(monkeypatch):
+    monkeypatch.setattr('wordshield.legacy.sys.platform', 'darwin')
     monkeypatch.delenv('WORDSHIELD_INHERIT_NETWORK_SANDBOX', raising=False)
     with patch('wordshield.legacy.validate_legacy_doc'):
         with pytest.raises(UnsafeDocument, match='изолированного'):
@@ -60,7 +61,8 @@ def test_converter_cleans_temp_files_on_timeout(monkeypatch):
     assert not source_paths[0].parent.exists()
 
 
-def test_ram_workspace_never_formats_unverified_device():
+def test_ram_workspace_never_formats_unverified_device(monkeypatch):
+    monkeypatch.setattr('wordshield.ram_workspace.sys.platform', 'darwin')
     import plistlib
     from wordshield.ram_workspace import ram_workspace
     calls = []

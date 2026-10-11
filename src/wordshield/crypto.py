@@ -4,6 +4,7 @@ import base64
 import os
 import subprocess
 import stat
+import sys
 from pathlib import Path
 
 from nacl.secret import Aead
@@ -11,12 +12,14 @@ from nacl.utils import random as random_bytes
 
 
 class KeyProvider:
-    """Reads the master key from macOS Keychain; env/file are explicit dev fallbacks."""
+    """Corp uses a mounted secret; the personal edition retains its key providers."""
 
     def __init__(self, data_dir: Path):
         self.data_dir = data_dir
 
     def master_key(self) -> bytes:
+        if os.getenv('WORDSHIELD_EDITION') == 'corp' and not os.getenv('WORDSHIELD_MASTER_KEY_FILE'):
+            raise RuntimeError('Corp requires WORDSHIELD_MASTER_KEY_FILE; no platform-keychain fallback')
         encoded = os.getenv("WORDSHIELD_MASTER_KEY")
         if secret := os.getenv('WORDSHIELD_MASTER_KEY_FILE'):
             if encoded or os.getenv('WORDSHIELD_DEV_KEY_FILE'):
@@ -30,6 +33,8 @@ class KeyProvider:
             if info.st_size > 128:
                 raise RuntimeError('Invalid master key file')
             encoded = path.read_text().strip()
+            if not encoded:
+                raise RuntimeError('Master key file is empty')
         if encoded:
             key = base64.urlsafe_b64decode(encoded)
         elif os.getenv("WORDSHIELD_DEV_KEY_FILE"):
@@ -42,6 +47,8 @@ class KeyProvider:
                 path.write_text(base64.urlsafe_b64encode(key).decode())
                 path.chmod(0o600)
         else:
+            if sys.platform != 'darwin' or os.getenv('WORDSHIELD_EDITION') == 'corp':
+                raise RuntimeError('Configure a mounted master key file on Linux')
             command = [
                 "security",
                 "find-generic-password",

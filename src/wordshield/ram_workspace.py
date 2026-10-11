@@ -1,4 +1,4 @@
-"""Private temporary conversion workspace backed by a newly created macOS RAM disk."""
+"""Private temporary workspace: dedicated Linux tmpfs or personal-edition RAM disk."""
 from contextlib import contextmanager
 from pathlib import Path
 import plistlib

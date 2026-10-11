@@ -63,29 +63,31 @@ class Settings:
 
     @classmethod
     def from_env(cls) -> Settings:
+        corporate = os.getenv('WORDSHIELD_EDITION') == 'corp'
+        qwen_required = _bool('WORDSHIELD_QWEN_REQUIRED', not corporate)
         return cls(
-            data_dir=Path(os.getenv("WORDSHIELD_DATA_DIR", "./data")).resolve(),
+            data_dir=Path(os.getenv("WORDSHIELD_DATA_DIR", "/data" if corporate else "./data")).resolve(),
             allowed_user=os.getenv("WORDSHIELD_ALLOWED_USER", ""),
-            trust_tailscale_headers=_bool("WORDSHIELD_TRUST_TAILSCALE_HEADERS", True),
+            trust_tailscale_headers=_bool("WORDSHIELD_TRUST_TAILSCALE_HEADERS", not corporate),
             lm_base_url=os.getenv("WORDSHIELD_LM_BASE_URL", "http://127.0.0.1:1234/v1"),
-            lm_token=_lm_token() if _bool('WORDSHIELD_QWEN_REQUIRED', True) else '',
+            lm_token=_lm_token() if qwen_required else '',
             lm_model=os.getenv("WORDSHIELD_LM_MODEL", "qwen/qwen3-14b"),
             privacy_checkpoint=os.getenv(
                 "WORDSHIELD_PRIVACY_CHECKPOINT",
-                "/Library/Application Support/WordShield/models/privacy-filter",
+                "/models/privacy" if corporate else "/Library/Application Support/WordShield/models/privacy-filter",
             ),
             privacy_device=os.getenv("WORDSHIELD_PRIVACY_DEVICE", "cpu"),
             privacy_required=_bool("WORDSHIELD_PRIVACY_REQUIRED", True),
-            qwen_required=_bool("WORDSHIELD_QWEN_REQUIRED", True),
+            qwen_required=qwen_required,
             render_required=_bool("WORDSHIELD_RENDER_REQUIRED", True),
-            libreoffice_path=os.getenv("WORDSHIELD_LIBREOFFICE", "soffice"),
+            libreoffice_path=os.getenv("WORDSHIELD_LIBREOFFICE", "/usr/bin/soffice" if corporate else "soffice"),
             retention_days=int(os.getenv("WORDSHIELD_RETENTION_DAYS", "90")),
             upload_ttl_hours=int(os.getenv("WORDSHIELD_UPLOAD_TTL_HOURS", "24")),
             max_upload_bytes=int(
                 os.getenv("WORDSHIELD_MAX_UPLOAD_BYTES", str(25 * 1024 * 1024))
             ),
-            gliner_required=_bool("WORDSHIELD_GLINER_REQUIRED", False),
-            gliner_checkpoint=os.getenv("WORDSHIELD_GLINER_CHECKPOINT", ""),
+            gliner_required=_bool("WORDSHIELD_GLINER_REQUIRED", corporate),
+            gliner_checkpoint=os.getenv("WORDSHIELD_GLINER_CHECKPOINT", "/models/gliner" if corporate else ""),
             gliner_python=os.getenv("WORDSHIELD_GLINER_PYTHON", ""),
             gliner_threshold=float(os.getenv("WORDSHIELD_GLINER_THRESHOLD", "0.5")),
             privacy_python=os.getenv("WORDSHIELD_PRIVACY_PYTHON", ""),
@@ -99,6 +101,10 @@ class Settings:
             raise ValueError("GLiNER threshold must be between zero and one")
         if self.gliner_required and not Path(self.gliner_checkpoint).is_absolute():
             raise ValueError("GLiNER must use an absolute local model directory")
+        if self.retention_days != 90:
+            raise ValueError("retention is fixed at 90 days for this deployment")
+        if os.getenv('WORDSHIELD_EDITION') == 'corp' and not self.qwen_required:
+            return  # No LM Studio client or endpoint is used in the Corp pipeline.
         if self.lm_model not in {"qwen/qwen3-14b", "qwen/qwen3.5-9b"}:
             raise ValueError("WORDSHIELD_LM_MODEL must be an approved local Qwen model")
         parsed = urlparse(self.lm_base_url)
@@ -117,5 +123,3 @@ class Settings:
                 raise ValueError(
                     "LM Studio host must be loopback or CGNAT Tailscale IP"
                 )
-        if self.retention_days != 90:
-            raise ValueError("retention is fixed at 90 days for this deployment")

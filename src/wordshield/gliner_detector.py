@@ -35,7 +35,7 @@ class GlinerDetector:
 
     async def _start(self):
         if sys.platform not in {"linux", "darwin"} or (sys.platform == "darwin" and not Path("/usr/bin/sandbox-exec").exists()):
-            raise DetectorUnavailable("Локальный детектор требует системную изоляцию сети macOS")
+            raise DetectorUnavailable("Требуется поддерживаемая системная изоляция сети: Linux seccomp или macOS sandbox")
         worker = str(Path(__file__).with_name("local_worker.py"))
         # macOS refuses applying a different nested sandbox. An inherited
         # application policy is acceptable only with the worker's active OS

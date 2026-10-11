@@ -23,5 +23,7 @@ def validate_corp(settings):
         raise ValueError('Corp requires a dedicated mounted master-key secret')
     if not Path(os.environ.get('WORDSHIELD_AUTH_FILE', '')).is_file():
         raise ValueError('Corp requires provisioned bootstrap credentials')
+    from .crypto import KeyProvider
+    KeyProvider(settings.data_dir).master_key()  # fail at startup, not on the first upload
     if settings.privacy_device not in {'cpu', 'cuda', 'cuda:0'} or os.getenv('WORDSHIELD_GLINER_DEVICE', 'cpu') not in {'cpu','cuda','cuda:0'}:
         raise ValueError('Unsupported detector device')

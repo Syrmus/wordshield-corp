@@ -1,6 +1,6 @@
 # WordShield Corp development boundaries
 
-This checkout is the corporate edition on branch `corp`. Read `CORP.md` before corporate implementation work.
+This is the independent `Syrmus/wordshield-corp` repository, default branch `main`. Read `CORP.md` before corporate implementation work.
 
 - Keep all corporate changes in this checkout and branch. Do not switch, edit, reset, commit, or deploy the user's personal checkout as part of Corp work.
 - Never run the inherited macOS deployment/update scripts against the personal Mac mini for Corp work. They are historical personal-edition tooling, not corporate deployment tools.
@@ -8,4 +8,4 @@ This checkout is the corporate edition on branch `corp`. Read `CORP.md` before c
 - No production rollout, public exposure, or changes to corporate identity/network infrastructure without explicit authorization and a verified target.
 - Use `deploy/corp` and `docs/corp` for the Linux pilot. Historical macOS instructions are personal-edition only. Real GPU and corporate identity acceptance are still required before production rollout.
 - Preserve existing local-only processing and account isolation. Do not bypass fail-closed safety checks to make Linux startup succeed.
-- Do not merge back into `main` or push a release as a normal implementation step; get explicit direction for those operations.
+- Never merge into or push to `Syrmus/wordshield-local` as part of Corp work. Release publication requires explicit direction. The historical `corp` branch in that repository is a rollback reference, not the active corporate source.

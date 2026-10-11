@@ -642,6 +642,34 @@ def __getattr__(name):
     raise AttributeError(name)
 
 
+CONTRACT_ROLES = frozenset(
+    "lender borrower seller buyer contractor customer supplier purchaser tenant landlord "
+    "заёмщик заемщик кредитор продавец покупатель исполнитель заказчик поставщик "
+    "арендатор арендодатель".split()
+)
+WORD_COUNTERS = frozenset(
+    "Pages Words Characters CharactersWithSpaces Lines Paragraphs TotalTime".split()
+)
+
+
+def _contract_role_label(text: str, start: int, end: int) -> bool:
+    """Exclude a role only in label/defined-term syntax, never by word alone."""
+    if text[start:end].casefold() not in CONTRACT_ROLES:
+        return False
+    before, after = text[:start], text[end:]
+    if (before and before[-1].isalnum()) or (after and after[0].isalnum()):
+        return False
+    # Do not drop a possible surname or the first word of a company name.
+    if re.match(r"\s+[A-ZА-ЯЁ]", after):
+        return False
+    return bool(
+        re.search(r"(?i)\bthe\s+$", before)
+        or (re.search(r"(?:^|[\n;])\s*$", before) and re.match(r"\s*:", after))
+        or (re.search(r"[«“\"]$", before) and re.match(r"[»”\"]", after)
+            and re.search(r"(?i)hereinafter|далее", before[-80:]))
+    )
+
+
 def normalize_detections(blocks: list[Block], detections: list[Detection]) -> list[Detection]:
     blocks_by_id = {b.id: b for b in blocks}
     block_map = {b.id: b.text for b in blocks}
@@ -649,6 +677,12 @@ def normalize_detections(blocks: list[Block], detections: list[Detection]) -> li
     for d in detections:
         text = block_map.get(d.block_id)
         if text is None or text[d.start:d.end] != d.exact_text:
+            continue
+        block = blocks_by_id[d.block_id]
+        if (block.part == "docProps/app.xml"
+                and block.kind in {"property:" + name for name in WORD_COUNTERS}
+                and re.fullmatch(r"\s*[0-9]+\s*", text)
+                and d.source in {"gliner-ru", "privacy-filter"}):
             continue
         if any(d.start < boundary < d.end
                for boundary in hard_boundaries(blocks_by_id[d.block_id])):
@@ -1092,6 +1126,11 @@ def merge_detections(blocks: list[Block], detections: list[Detection]) -> list[F
             )
         )
     candidates = _prefer_precise(candidates, block_map)
+    candidates = [f for f in candidates if not (
+        f.entity_type in {"PERSON", "PII"}
+        and set(f.sources) <= {"gliner-ru", "privacy-filter", "compound-gap"}
+        and _contract_role_label(block_map[f.block_id].text, f.start, f.end)
+    )]
     candidates = _coalesce_person_names(candidates, blocks)
     resolve_clear_document_id_overlaps(candidates)
     # Remaining overlaps are genuinely ambiguous and require a decision.
